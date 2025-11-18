@@ -1,3 +1,5 @@
+from itertools import count
+
 from led.archs import build_network
 from led.utils.options import yaml_load
 from led.data.raw_utils import metainfo, pack_raw_bayer, depack_raw_bayer
@@ -7,9 +9,13 @@ from copy import deepcopy
 import argparse
 import glob
 import numpy as np
-import cv2
 import os
 from tqdm import tqdm
+from pidng.core import RAW2DNG, DNGTags, Tag
+from pidng.defs import *
+import pathlib
+import exiftool
+import cv2
 
 def load_network(net, load_path, strict=True, param_key='params'):
     """Load network.
@@ -38,17 +44,16 @@ def load_network(net, load_path, strict=True, param_key='params'):
 
 
 def get_available_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
+    # if torch.cuda.is_available():
+    #     return torch.device('cuda')
+    # if torch.backends.mps.is_available():
+    #     return torch.device('mps')
     return torch.device('cpu')
 
 
-def read_img(raw_path):
-    raw = rawpy.imread(raw_path)
-    raw_vis = raw.raw_image_visible.copy()
-    raw_pattern = raw.raw_pattern
+def read_img(raw):
+    #raw_vis = raw.raw_image_visible.copy()
+
     black_level = np.array(raw.black_level_per_channel, dtype=np.float32).reshape(1, 4, 1, 1)
     white_level = np.array(raw.camera_white_level_per_channel, dtype=np.float32)
     if (white_level == None).any():
@@ -56,21 +61,62 @@ def read_img(raw_path):
     if white_level.size == 1:
         white_level = white_level.repeat(4, 0)
     white_level = white_level.reshape(1, 4, 1, 1)
-    raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw_vis, raw_pattern))[np.newaxis]).contiguous()
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
-    return raw, raw_pattern, raw_packed, black_level, white_level
+
+    color_matrix = [[int(round(x * 10000)), 10000] for x in raw.rgb_xyz_matrix[:3].flatten()]
+
+    r, g1, b, g2 = np.array(raw.camera_whitebalance, dtype=np.uint)
+    white_balance = [[g1, r], [g1, g2], [g2, b]]
+
+    rawImage = raw.raw_image
+    cfa_pattern_size = list(raw.raw_pattern.shape)
+    cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
+    raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
+
+    return raw_packed, black_level, white_level, white_balance, color_matrix, cfa_pattern, cfa_pattern_size
 
 
-def postprocess(raw, raw_pattern, im, bl, wl, output_bps=16):
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, cm, cfa, cfa_size):
+    height, width = rawImage.shape
+
+    # set DNG tags.
+    t = DNGTags()
+    t.set(Tag.ImageWidth, width)
+    t.set(Tag.ImageLength, height)
+    t.set(Tag.TileWidth, width)
+    t.set(Tag.TileLength, height)
+    t.set(Tag.Orientation, Orientation.Horizontal)
+    t.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
+    t.set(Tag.SamplesPerPixel, 1)
+    t.set(Tag.BitsPerSample, bpp)
+    t.set(Tag.CFARepeatPatternDim, cfa_size)
+    t.set(Tag.CFAPattern, cfa)
+    t.set(Tag.BlackLevel, int(torch.mean(bl)))
+    t.set(Tag.WhiteLevel, int(torch.mean(wl)))
+    t.set(Tag.ColorMatrix1, cm)
+    t.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.D65)
+    t.set(Tag.AsShotNeutral, wb)
+    t.set(Tag.BaselineExposure, [[1, 1]])
+    t.set(Tag.Make, "Canon")
+    t.set(Tag.Model, "EOS R7")
+    t.set(Tag.DNGVersion, DNGVersion.V1_4)
+    t.set(Tag.DNGBackwardVersion, DNGVersion.V1_2)
+    t.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
+
+    # save to dng file.
+    r = RAW2DNG()
+    r.options(t, path="", compress=True)
+    r.convert(rawImage, filename)
+
+
+def  postprocess(raw, im, bl, wl, output_bps=16):
     im = im * (wl - bl) + bl
     im = im.numpy()[0]
-    im = depack_raw_bayer(im, raw_pattern)
+    im = depack_raw_bayer(im, raw.raw_pattern)
     H, W = im.shape
     raw.raw_image_visible[:H, :W] = im
-    rgb = raw.postprocess(use_camera_wb=True, half_size=False, no_auto_bright=True, output_bps=output_bps)
-    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    return rgb
+    return im
 
 @torch.no_grad()
 def image_process():
@@ -91,7 +137,7 @@ def image_process():
     load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
     device = get_available_device()
     network_g = network_g.to(device)
-    raw_paths = list(sorted(glob.glob(f'{args.data_path}/*')))
+    raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
 
@@ -99,17 +145,41 @@ def image_process():
         if args.target_exposure is not None:
             iso, exp_time = metainfo(raw_path)
             ratio = args.target_exposure / (iso * exp_time)
-        raw, raw_pattern, im, bl, wl = read_img(raw_path)
-        im = (im - bl) / (wl - bl)
-        im = (im * ratio).clip(max=torch.tensor(1.0))
-        im = im.to(device)
+        with rawpy.imread(raw_path) as raw:
+            im, bl, wl, wb, cm, cfa, cfa_size = read_img(raw)
+            im = (im - bl) / (raw.white_level - bl)
+            im = (im * ratio).clip(max=torch.tensor(1.0))
 
-        result = network_g(im)
+            # margin = 32
+            # im_part = []
+            # im_part.append(im[:, :, :im.shape[2]//2 + margin, :im.shape[3]//2 + margin])
+            # im_part.append(im[:, :, :im.shape[2]//2 + margin, im.shape[3]//2 - margin:])
+            # im_part.append(im[:, :, im.shape[2]//2 - margin:, :im.shape[3]//2 + margin])
+            # im_part.append(im[:, :, im.shape[2]//2 - margin:, im.shape[3]//2 - margin:])
+            #
+            # result_part = []
+            # for image in im_part:
+            #     image = image.to(device)
+            #     result_part.append(network_g(image).clip(0, 1).cpu())
+            #
+            # result_top = torch.cat([result_part[0][:, :, 0:-margin, 0:-margin], result_part[1][:, :, 0:-margin, margin:]], dim=3)
+            # result_bottom = torch.cat([result_part[2][:, :, margin:, 0:-margin], result_part[3][:, :, margin:, margin:]], dim=3)
+            # result = torch.cat([result_top, result_bottom], dim=2)
 
-        result = result.clip(0, 1).cpu()
-        rgb = postprocess(raw, raw_pattern, result, bl, wl, args.bps)
-        cv2.imwrite(raw_path.replace(args.data_path, args.save_path)+'.png', rgb)
-        raw.close()
+            #exit(0)
+            im = im.to(device)
+            result = network_g(im)
+            result = result.clip(0, 1).cpu()
+
+            bayer_result = postprocess(raw, result, bl, raw.white_level, args.bps)
+            #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
+            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + ".dng")
+            save_as_dng(bayer_result, output_name, args.bps, bl, wl, wb, cm, cfa, cfa_size)
+            with exiftool.ExifTool() as et:
+                et.execute(b"-overwrite_original",
+                           f"-tagsFromFile={raw_path}".encode("utf-8"),
+                           b"-all:all",
+                           output_name.encode("utf-8"))
 
 if __name__ == '__main__':
     image_process()

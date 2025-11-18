@@ -1,7 +1,8 @@
 import numpy as np
 import os
 import exifread
-
+import subprocess
+import json
 
 Sony_A7S2_CCM = np.array([[ 1.9712269,-0.6789218, -0.29230508],
                           [-0.29104823, 1.748401 , -0.45735288],
@@ -51,12 +52,21 @@ def depack_raw_bayer(raw: np.ndarray, raw_pattern: np.ndarray):
 
 def metainfo(rawpath):
     with open(rawpath, 'rb') as f:
-        tags = exifread.process_file(f)
         _, suffix = os.path.splitext(os.path.basename(rawpath))
+        if suffix == '.CR3':
+            result = subprocess.run(
+            ["exiftool", "-json", rawpath], capture_output=True, text=True, check=True
+        )
+            tags = json.loads(result.stdout)[0]
+        else:
+            tags = exifread.process_file(f)
 
         if suffix == '.dng':
             expo = eval(str(tags['Image ExposureTime']))
             iso = eval(str(tags['Image ISOSpeedRatings']))
+        elif suffix == '.CR3':
+            expo = eval(str(tags['ExposureTime']))
+            iso = eval(str(tags['ISO']))
         else:
             expo = eval(str(tags['EXIF ExposureTime']))
             iso = eval(str(tags['EXIF ISOSpeedRatings']))
