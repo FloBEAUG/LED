@@ -106,7 +106,7 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, cm, cfa, cfa_size):
 
     # save to dng file.
     r = RAW2DNG()
-    r.options(t, path="", compress=True)
+    r.options(t, path="", compress=False)
     r.convert(rawImage, filename)
 
 
@@ -177,9 +177,9 @@ def image_process():
             save_as_dng(bayer_result, output_name, args.bps, bl, wl, wb, cm, cfa, cfa_size)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
-                           f"-tagsFromFile={raw_path}".encode("utf-8"),
-                           b"-all:all",
-                           output_name.encode("utf-8"))
+                            f"-tagsFromFile={raw_path}".encode("utf-8"),
+                            b"-all:all",
+                            output_name.encode("utf-8"))
 
 if __name__ == '__main__':
     image_process()
