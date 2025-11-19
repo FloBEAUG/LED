@@ -57,8 +57,13 @@ class FewshotPairedRAWDataset(data.Dataset):
         ccm = Sony_A7S2_CCM.copy()
         black_level = np.array(raw.black_level_per_channel,
                                 dtype='float32').reshape(4, 1, 1)
-        white_level = np.array(raw.camera_white_level_per_channel,
-                                dtype='float32').reshape(4, 1, 1)
+        # Some cameras dont have white level per chanel
+        if raw.camera_white_level_per_channel is None:
+            white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
+        else:
+            white_level = np.array(raw.camera_white_level_per_channel,
+                                    dtype='float32').reshape(4, 1, 1)
+        print(f"White Level : {white_level}")
         im = pack_raw_bayer(raw_vis, raw_pattern).astype('float32')
         raw.close()
 
