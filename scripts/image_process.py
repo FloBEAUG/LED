@@ -51,33 +51,51 @@ def get_available_device():
     return torch.device('cpu')
 
 
-def read_img(raw):
-    #raw_vis = raw.raw_image_visible.copy()
+def read_img(raw, raw_path):
+    with exiftool.ExifToolHelper() as et:
+        metadata = et.get_metadata(raw_path)
 
-    black_level = np.array(raw.black_level_per_channel, dtype=np.float32).reshape(1, 4, 1, 1)
-    white_level = np.array(raw.camera_white_level_per_channel, dtype=np.float32)
-    if (white_level == None).any():
-        white_level = np.array(raw.white_level, dtype=np.float32)
-    if white_level.size == 1:
-        white_level = white_level.repeat(4, 0)
-    white_level = white_level.reshape(1, 4, 1, 1)
+
+    black_level = np.array(raw.black_level_per_channel,
+                                    dtype='float32').reshape(1,4, 1, 1)
+
+    if raw.camera_white_level_per_channel is None:
+        white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
+    else:
+        white_level = np.array(raw.camera_white_level_per_channel,
+                                    dtype='float32').reshape(1,4, 1, 1)
+
+
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
 
-    color_matrix = [[int(round(x * 10000)), 10000] for x in raw.rgb_xyz_matrix[:3].flatten()]
-
-    r, g1, b, g2 = np.array(raw.camera_whitebalance, dtype=np.uint)
-    white_balance = [[g1, r], [g1, g2], [g2, b]]
+    r, g1, b, g2 = np.array(np.array(raw.camera_whitebalance, dtype='float32') * 10000, dtype=np.uint)
+    if g2 != 0:
+        white_balance = [[g1, r], [g1, g2], [g2, b]]
+    else:
+        white_balance = [[g1, r], [g1, g1], [g1, b]]
 
     rawImage = raw.raw_image
     cfa_pattern_size = list(raw.raw_pattern.shape)
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
     raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
 
-    return raw_packed, black_level, white_level, white_balance, color_matrix, cfa_pattern, cfa_pattern_size
+
+    color_matrices = []
+    if np.array(raw.rgb_xyz_matrix).any():
+        color_matrices.append(np.array(raw.rgb_xyz_matrix[:3]).flatten())
+    else:
+        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix1'], dtype='float32', sep= ' '))
+        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix2'], dtype='float32', sep= ' '))
+
+    for i in range(len(color_matrices)):
+        color_matrices[i] = [[int(round(x * 10000)), 10000] for x in color_matrices[i]]
 
 
-def save_as_dng(rawImage, filename, bpp, bl, wl, wb, cm, cfa, cfa_size):
+    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
+
+
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     height, width = rawImage.shape
 
     # set DNG tags.
@@ -94,8 +112,11 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, cm, cfa, cfa_size):
     t.set(Tag.CFAPattern, cfa)
     t.set(Tag.BlackLevel, int(torch.mean(bl)))
     t.set(Tag.WhiteLevel, int(torch.mean(wl)))
-    t.set(Tag.ColorMatrix1, cm)
+    t.set(Tag.ColorMatrix1, ccms[0])
     t.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.D65)
+    if len(ccms) > 1:
+        t.set(Tag.ColorMatrix2, ccms[1])
+        t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.Standard_Light_A)
     t.set(Tag.AsShotNeutral, wb)
     t.set(Tag.BaselineExposure, [[1, 1]])
     t.set(Tag.Make, "Canon")
@@ -146,7 +167,7 @@ def image_process():
             iso, exp_time = metainfo(raw_path)
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
-            im, bl, wl, wb, cm, cfa, cfa_size = read_img(raw)
+            im, bl, wl, wb, ccms, cfa, cfa_size = read_img(raw, raw_path)
             im = (im - bl) / (raw.white_level - bl)
             im = (im * ratio).clip(max=torch.tensor(1.0))
 
@@ -173,8 +194,8 @@ def image_process():
 
             bayer_result = postprocess(raw, result, bl, raw.white_level, args.bps)
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
-            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + ".dng")
-            save_as_dng(bayer_result, output_name, args.bps, bl, wl, wb, cm, cfa, cfa_size)
+            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
+            save_as_dng(bayer_result, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),

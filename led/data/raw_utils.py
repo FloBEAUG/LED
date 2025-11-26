@@ -52,24 +52,17 @@ def depack_raw_bayer(raw: np.ndarray, raw_pattern: np.ndarray):
 
 def metainfo(rawpath):
     with open(rawpath, 'rb') as f:
-        _, suffix = os.path.splitext(os.path.basename(rawpath))
-        if suffix == '.CR3':
-            result = subprocess.run(
+
+        result = subprocess.run(
             ["exiftool", "-json", rawpath], capture_output=True, text=True, check=True
         )
-            tags = json.loads(result.stdout)[0]
-        else:
-            tags = exifread.process_file(f)
+        tags = json.loads(result.stdout)[0]
 
-        if suffix == '.dng':
-            expo = eval(str(tags['Image ExposureTime']))
-            iso = eval(str(tags['Image ISOSpeedRatings']))
-        elif suffix == '.CR3':
-            expo = eval(str(tags['ExposureTime']))
-            iso = eval(str(tags['ISO']))
+        keys = [key for key in tags.keys() if "ExposureTime" in key or "ISO" in key]
+        if len(keys) >= 2:
+            expo = eval(str((tags[keys[0]])))
+            iso = eval(str(tags[keys[1]]))
         else:
-            expo = eval(str(tags['EXIF ExposureTime']))
-            iso = eval(str(tags['EXIF ISOSpeedRatings']))
+            return None, None
 
-        # print('ISO: {}, ExposureTime: {}'.format(iso, expo))
     return iso, expo
