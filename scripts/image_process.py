@@ -61,19 +61,21 @@ def read_img(raw, raw_path):
 
     if raw.camera_white_level_per_channel is None:
         white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
+
     else:
         white_level = np.array(raw.camera_white_level_per_channel,
                                     dtype='float32').reshape(1,4, 1, 1)
 
+    white_level = np.array([12735] * 4, dtype='float32').reshape(4, 1, 1)
 
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
 
     r, g1, b, g2 = np.array(np.array(raw.camera_whitebalance, dtype='float32') * 10000, dtype=np.uint)
     if g2 != 0:
-        white_balance = [[g1, r], [g1, g2], [g2, b]]
+        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g2 * 10000), 10000], [int(g2/b * 10000), 10000]]
     else:
-        white_balance = [[g1, r], [g1, g1], [g1, b]]
+        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g1 * 10000), 10000], [int(g2/b * 10000), 10000]]
 
     rawImage = raw.raw_image
     cfa_pattern_size = list(raw.raw_pattern.shape)
@@ -98,6 +100,10 @@ def read_img(raw, raw_path):
 def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     height, width = rawImage.shape
 
+    ccms = []
+    ccms.append([[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000], [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]])
+    ccms.append([[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000], [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]])
+
     # set DNG tags.
     t = DNGTags()
     t.set(Tag.ImageWidth, width)
@@ -110,13 +116,13 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     t.set(Tag.BitsPerSample, bpp)
     t.set(Tag.CFARepeatPatternDim, cfa_size)
     t.set(Tag.CFAPattern, cfa)
-    t.set(Tag.BlackLevel, int(torch.mean(bl)))
+    t.set(Tag.BlackLevelRepeatDim, [2, 2])
+    t.set(Tag.BlackLevel, [2046, 2047, 2047, 2047])
     t.set(Tag.WhiteLevel, int(torch.mean(wl)))
     t.set(Tag.ColorMatrix1, ccms[0])
-    t.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.D65)
-    if len(ccms) > 1:
-        t.set(Tag.ColorMatrix2, ccms[1])
-        t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.Standard_Light_A)
+    t.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.Standard_Light_A)
+    t.set(Tag.ColorMatrix2, ccms[1])
+    t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.D65)
     t.set(Tag.AsShotNeutral, wb)
     t.set(Tag.BaselineExposure, [[1, 1]])
     t.set(Tag.Make, "Canon")

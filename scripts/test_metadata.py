@@ -35,7 +35,10 @@ def read_img(raw, raw_path):
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
 
+    print(raw.camera_whitebalance)
+
     r, g1, b, g2 = np.array(np.array(raw.camera_whitebalance, dtype='float32') * 10000, dtype=np.uint)
+    print(f"{r}, {g1}, {b}, {g2}")
     if g2 != 0:
         white_balance = [[g1, r], [g1, g2], [g2, b]]
     else:
@@ -83,16 +86,16 @@ def image_process():
         with rawpy.imread(raw_path) as raw:
             im, bl, wl, wb, ccms, cfa, cfa_size = read_img(raw, raw_path)
 
-        print(f"""ISO : {iso}
-        Exposure : {exp_time}
-        Black Level : {bl}
-        White Level : {wl}
-        White Balance : {wb}
-        Color Matrices : {ccms}
-        CFA Pattern : {cfa}
-        Pattern Size : {cfa_size}
-        {'-' * 30}
-""")
+#         print(f"""ISO : {iso}
+#         Exposure : {exp_time}
+#         Black Level : {bl}
+#         White Level : {wl}
+#         White Balance : {wb}
+#         Color Matrices : {ccms}
+#         CFA Pattern : {cfa}
+#         Pattern Size : {cfa_size}
+#         {'-' * 30}
+# """)
 
 if __name__ == '__main__':
     image_process()
