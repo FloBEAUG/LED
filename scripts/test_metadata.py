@@ -18,8 +18,14 @@ import exiftool
 import cv2
 
 def read_img(raw, raw_path):
+    
     with exiftool.ExifToolHelper() as et:
         metadata = et.get_metadata(raw_path)
+        
+    for key, value in metadata[0].items():
+        if "Border" in key:
+            print(f"{key} : {value}")
+    print(raw.raw_image.shape)
 
 
     black_level = np.array(raw.black_level_per_channel,
@@ -34,6 +40,9 @@ def read_img(raw, raw_path):
 
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
+    
+    print(torch.reshape(black_level, (-1,)).type(torch.int32).tolist())
+    exit(0)
 
     print(raw.camera_whitebalance)
 
