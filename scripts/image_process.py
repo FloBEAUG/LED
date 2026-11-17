@@ -11,8 +11,6 @@ import glob
 import numpy as np
 import os
 from tqdm import tqdm
-from pidng.core import RAW2DNG, DNGTags, Tag
-from pidng.defs import *
 import pathlib
 import exiftool
 import cv2
@@ -95,59 +93,12 @@ def read_img(raw, raw_path):
     return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
 
 
-def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
-    height, width = rawImage.shape
-
-    ccms = []
-    ccms.append([[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000], [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]])
-    ccms.append([[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000], [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]])
-
-    fwms = []
-    fwms.append([[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]])
-    fwms.append([[4590, 10000], [2857, 10000], [2196, 10000], [2642, 10000], [6660, 10000], [698, 10000], [1219, 10000], [39, 10000], [6994, 10000]])
-    
-    ccs = []
-    ccs.append([[10122, 10000], [0, 10000], [0, 10000], [0, 10000], [10000, 10000], [0, 10000], [0, 10000], [0, 10000], [9747, 10000]])
-    ccs.append([[10122, 10000], [0, 10000], [0, 10000], [0, 10000], [10000, 10000], [0, 10000], [0, 10000], [0, 10000], [9747, 10000]])
-
-    # set DNG tags.
-    t = DNGTags()
-    t.set(Tag.ImageWidth, width)
-    t.set(Tag.ImageLength, height)
-    t.set(Tag.ActiveArea, [0, 0, height, width])
-    t.set(Tag.TileWidth, width)
-    t.set(Tag.TileLength, height)
-    t.set(Tag.Orientation, Orientation.Horizontal)
-    t.set(Tag.PhotometricInterpretation, PhotometricInterpretation.Color_Filter_Array)
-    t.set(Tag.SamplesPerPixel, 1)
-    t.set(Tag.BitsPerSample, bpp)
-    t.set(Tag.CFARepeatPatternDim, cfa_size)
-    t.set(Tag.CFAPattern, cfa)
-    #t.set(Tag.CFAPlaneColor, [0, 1, 2])
-    #t.set(Tag.CFALayout, [1])
-    #t.set(Tag.ForwardMatrix1, fwms[0])
-    #t.set(Tag.ForwardMatrix2, fwms[1])
-    #t.set(Tag.CameraCalibration1, ccs[0])
-    #t.set(Tag.CameraCalibration2, ccs[1])
-    t.set(Tag.BlackLevelRepeatDim, [2, 2])
-    t.set(Tag.BlackLevel, torch.reshape(bl, (-1,)).type(torch.int32).tolist())
-    t.set(Tag.WhiteLevel, int(torch.mean(wl)))
-    t.set(Tag.ColorMatrix1, ccms[0])
-    t.set(Tag.CalibrationIlluminant1, CalibrationIlluminant.Standard_Light_A)
-    t.set(Tag.ColorMatrix2, ccms[1])
-    t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.D65)
-    t.set(Tag.AsShotNeutral, wb)
-    #t.set(Tag.BaselineExposure, [[35, 100]])
-    t.set(Tag.Make, "Canon")
-    t.set(Tag.Model, "EOS R7")
-    t.set(Tag.DNGVersion, DNGVersion.V1_6)
-    t.set(Tag.DNGBackwardVersion, DNGVersion.V1_4)
-    t.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
-
-    # save to dng file.
-    r = RAW2DNG()
-    r.options(t, path="", compress=False)
-    r.convert(rawImage, filename)
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, metadata=None, raw_path=None):
+    from led.utils import save_dng, get_dng_metadata
+    if metadata is None and raw_path is not None:
+        metadata = get_dng_metadata(raw_path)
+    save_dng(rawImage, filename, bpp=bpp, black_level=bl, white_level=wl,
+             wb=wb, ccms=ccms, metadata=metadata)
 
 
 def  postprocess(raw, im, bl, wl, output_bps=16):
@@ -214,7 +165,8 @@ def image_process():
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
             output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
             
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size)
+            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size,
+                        raw_path=raw_path)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
