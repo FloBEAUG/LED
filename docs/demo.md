@@ -73,7 +73,7 @@ optional arguments:
   --data_path DATA_PATH
                         the folder where contains only your raw images.
   --save_path SAVE_PATH
-                        the folder where to save the processed images (in rgb), DEFAULT: 'inference/image_process'
+                        the folder where to save the processed images (in dng), DEFAULT: 'inference/image_process'
   -opt NETWORK_OPTIONS, --network_options NETWORK_OPTIONS
                         the arch options of the pretrained network, DEFAULT: 'options/base/network_g/unet.yaml'
   --ratio RATIO, --dgain RATIO
