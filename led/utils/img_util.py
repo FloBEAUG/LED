@@ -303,16 +303,32 @@ def save_dng(raw_image, file_path, bpp=16, black_level=None, white_level=None, w
             mat = np.stack([mat.reshape(-1), np.full(mat.shape[0], 10000)], axis=1)
         return [[int(round(float(v[0]))), int(v[1])] for v in mat]
 
-    ccms = _to_pairs(cm1) if ccms is None else ccms
+    # ccms may be None, a single color matrix (9 pairs), or a list [matrix1, matrix2]
+    # as returned by read_img in scripts/image_process.py.
     ccms2 = _to_pairs(cm2)
+    if ccms is not None:
+        if isinstance(ccms, (list, tuple)) and len(ccms) == 2:
+            ccms = _to_pairs(ccms[0])
+            ccms2 = _to_pairs(ccms[1])
+        elif isinstance(ccms, (list, tuple)) and len(ccms) == 1:
+            ccms = _to_pairs(ccms[0])
+        else:
+            ccms = _to_pairs(ccms)
+    else:
+        ccms = _to_pairs(cm1)
 
     # AsShotNeutral: [r/g, 10000, b/g, 10000] style pairs (3 pairs).
-    wb_vals = np.asarray(wb_vals, dtype='float32').reshape(-1)
-    g = wb_vals[1] if wb_vals.size > 1 and wb_vals[1] != 0 else 1.0
-    r = wb_vals[0] if wb_vals.size > 0 else 1.0
-    b = wb_vals[2] if wb_vals.size > 2 else 1.0
-    as_shot_neutral = [[int(round(r / g * 10000)), 10000], [10000, 10000],
-                       [int(round(b / g * 10000)), 10000]]
+    wb_arr = np.asarray(wb_vals, dtype='float32')
+    if wb_arr.ndim == 2 and wb_arr.shape == (3, 2):
+        # already in [[num, denom], ...] AsShotNeutral pair format (from read_img)
+        as_shot_neutral = [[int(round(float(v[0]))), int(v[1])] for v in wb_arr]
+    else:
+        wb_flat = wb_arr.reshape(-1)
+        g = wb_flat[1] if wb_flat.size > 1 and wb_flat[1] != 0 else 1.0
+        r = wb_flat[0] if wb_flat.size > 0 else 1.0
+        b = wb_flat[2] if wb_flat.size > 2 else 1.0
+        as_shot_neutral = [[int(round(r / g * 10000)), 10000], [10000, 10000],
+                           [int(round(b / g * 10000)), 10000]]
 
     # Black level as list of 4 ints.
     bl_list = np.asarray(bl, dtype='float32').reshape(-1)

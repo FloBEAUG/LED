@@ -2,6 +2,7 @@ from itertools import count
 
 from led.archs import build_network
 from led.utils.options import yaml_load
+from led.utils import tensor_to_bayer_dng
 from led.data.raw_utils import metainfo, pack_raw_bayer, depack_raw_bayer
 import rawpy
 import torch
@@ -42,10 +43,8 @@ def load_network(net, load_path, strict=True, param_key='params'):
 
 
 def get_available_device():
-    # if torch.cuda.is_available():
-    #     return torch.device('cuda')
-    # if torch.backends.mps.is_available():
-    #     return torch.device('mps')
+    if torch.cuda.is_available():
+        return torch.device('cuda')
     return torch.device('cpu')
 
 
@@ -140,33 +139,36 @@ def image_process():
             im = (im - bl) / (raw.white_level - bl)
             im = (im * ratio).clip(max=torch.tensor(1.0))
 
-            # margin = 32
-            # im_part = []
-            # im_part.append(im[:, :, :im.shape[2]//2 + margin, :im.shape[3]//2 + margin])
-            # im_part.append(im[:, :, :im.shape[2]//2 + margin, im.shape[3]//2 - margin:])
-            # im_part.append(im[:, :, im.shape[2]//2 - margin:, :im.shape[3]//2 + margin])
-            # im_part.append(im[:, :, im.shape[2]//2 - margin:, im.shape[3]//2 - margin:])
-            #
-            # result_part = []
-            # for image in im_part:
-            #     image = image.to(device)
-            #     result_part.append(network_g(image).clip(0, 1).cpu())
-            #
-            # result_top = torch.cat([result_part[0][:, :, 0:-margin, 0:-margin], result_part[1][:, :, 0:-margin, margin:]], dim=3)
-            # result_bottom = torch.cat([result_part[2][:, :, margin:, 0:-margin], result_part[3][:, :, margin:, margin:]], dim=3)
-            # result = torch.cat([result_top, result_bottom], dim=2)
-
-            #exit(0)
-            im = im.to(device)
-            result = network_g(im)
+            margin = 32
+            h, w = im.shape[2], im.shape[3]
+            h_half, w_half = h // 2, w // 2
+            im_parts = [
+                im[:, :, :h_half + margin, :w_half + margin],
+                im[:, :, :h_half + margin, w_half - margin:],
+                im[:, :, h_half - margin:, :w_half + margin],
+                im[:, :, h_half - margin:, w_half - margin:],
+            ]
+            result_parts = []
+            for part in im_parts:
+                part = part.to(device)
+                result_parts.append(network_g(part).clip(0, 1).cpu())
+            result_top = torch.cat([result_parts[0][:, :, 0:-margin, 0:-margin],
+                                    result_parts[1][:, :, 0:-margin, margin:]], dim=3)
+            result_bottom = torch.cat([result_parts[2][:, :, margin:, 0:-margin],
+                                       result_parts[3][:, :, margin:, margin:]], dim=3)
+            result = torch.cat([result_top, result_bottom], dim=2)
             result = result.clip(0, 1).cpu()
 
-            postprocess(raw, result, bl, raw.white_level, args.bps)
+            from led.utils import get_dng_metadata
+            metadata = get_dng_metadata(raw_path)
+            bl_np = metadata['black_level']
+            wl_val = metadata['white_level']
+            full_bayer = tensor_to_bayer_dng(result[0], bl_np, wl_val, metadata['cfa_pattern'])
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
             output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
-            
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size,
-                        raw_path=raw_path)
+
+            save_as_dng(full_bayer, output_name, args.bps, bl_np, wl_val, wb, ccms, cfa, cfa_size,
+                        metadata=metadata, raw_path=raw_path)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
