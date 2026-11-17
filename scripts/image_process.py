@@ -3,7 +3,7 @@ from itertools import count
 from led.archs import build_network
 from led.utils.options import yaml_load
 from led.utils import get_dng_metadata, save_dng, tensor_to_bayer_dng
-from led.data.raw_utils import metainfo, pack_raw_bayer, depack_raw_bayer
+from led.data.raw_utils import metainfo, pack_raw_bayer
 import rawpy
 import torch
 from copy import deepcopy
@@ -142,22 +142,17 @@ def image_process():
             result = network_g(im)
             result = result.clip(0, 1).cpu()
 
-            # Denormalize and depack to full Bayer, write to raw.raw_image_visible
-            # (matches original postprocess behavior; raw.raw_image shares memory)
-            bl_np = bl.numpy().reshape(4, 1, 1)
-            wl_np = wl.numpy().reshape(4, 1, 1)
-            result_np = result.numpy()[0] * (wl_np - bl_np) + bl_np
-            full_bayer = depack_raw_bayer(result_np, raw.raw_pattern)
-            H, W = full_bayer.shape
-            raw.raw_image_visible[:H, :W] = full_bayer
-
-            # Save full sensor (raw.raw_image includes border pixels)
+            # convert denoised packed bayer (1, 4, H/2, W/2) -> full uint16 bayer (H, W)
             metadata = get_dng_metadata(raw_path)
+            bl_np = metadata['black_level']
+            wl_val = metadata['white_level']
+            full_bayer = tensor_to_bayer_dng(result[0], bl_np, wl_val, metadata['cfa_pattern'])
+
             output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
-            save_dng(raw.raw_image, output_name, bpp=args.bps,
-                     black_level=metadata['black_level'],
-                     white_level=metadata['white_level'],
-                     wb=wb, ccms=None, metadata=metadata)
+
+            save_as_dng(full_bayer, output_name, args.bps, bl_np, wl_val,
+                        wb, ccms, cfa, cfa_size,
+                        metadata=metadata, raw_path=raw_path)
 
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
