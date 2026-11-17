@@ -114,7 +114,7 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     t = DNGTags()
     t.set(Tag.ImageWidth, width)
     t.set(Tag.ImageLength, height)
-    t.set(Tag.ActiveArea, [72, 144, 4732, 7128])
+    t.set(Tag.ActiveArea, [0, 0, height, width])
     t.set(Tag.TileWidth, width)
     t.set(Tag.TileLength, height)
     t.set(Tag.Orientation, Orientation.Horizontal)
