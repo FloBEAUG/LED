@@ -47,25 +47,21 @@ def read_img(raw, raw_path):
     with exiftool.ExifToolHelper() as et:
         metadata = et.get_metadata(raw_path)
 
-
-    black_level = np.array(raw.black_level_per_channel,
-                                    dtype='float32').reshape(1,4, 1, 1)
+    black_level = np.array(raw.black_level_per_channel, dtype='float32').reshape(1, 4, 1, 1)
 
     if raw.camera_white_level_per_channel is None:
         white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
-
     else:
-        white_level = np.array(raw.camera_white_level_per_channel,
-                                    dtype='float32').reshape(1,4, 1, 1)
+        white_level = np.array(raw.camera_white_level_per_channel, dtype='float32').reshape(1, 4, 1, 1)
 
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
 
     r, g1, b, g2 = np.array(np.array(raw.camera_whitebalance, dtype='float32') * 10000, dtype=np.uint)
     if g2 != 0:
-        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g2 * 10000), 10000], [int(g2/b * 10000), 10000]]
+        white_balance = [[int(g1 / r * 10000), 10000], [int(g1 / g2 * 10000), 10000], [int(g2 / b * 10000), 10000]]
     else:
-        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g1 * 10000), 10000], [int(g2/b * 10000), 10000]]
+        white_balance = [[int(g1 / r * 10000), 10000], [int(g1 / g1 * 10000), 10000], [int(g2 / b * 10000), 10000]]
 
     cfa_pattern_size = list(raw.raw_pattern.shape)
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
@@ -75,8 +71,8 @@ def read_img(raw, raw_path):
     if np.array(raw.rgb_xyz_matrix).any():
         color_matrices.append(np.array(raw.rgb_xyz_matrix[:3]).flatten())
     else:
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix1'], dtype='float32', sep= ' '))
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix2'], dtype='float32', sep= ' '))
+        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix1'], dtype='float32', sep=' '))
+        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix2'], dtype='float32', sep=' '))
 
     for i in range(len(color_matrices)):
         color_matrices[i] = [[int(round(x * 10000)), 10000] for x in color_matrices[i]]
@@ -97,11 +93,11 @@ def image_process():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--pretrained_network', type=str, required=True, help='the pretrained network path.')
     parser.add_argument('--data_path', type=str, required=True, help='the folder where contains only your raw images.')
-    parser.add_argument('--save_path', type=str, default='inference/image_process', help='the folder where to save the processed images (in rgb), DEFAULT: \'inference/image_process\'')
+    parser.add_argument('--save_path', type=str, default='inference/image_process', help='the folder where to save the processed images (in dng), DEFAULT: \'inference/image_process\'')
     parser.add_argument('-opt', '--network_options', default='options/base/network_g/unet.yaml', help='the arch options of the pretrained network, DEFAULT: \'options/base/network_g/unet.yaml\'')
     parser.add_argument('--ratio', '--dgain', type=float, default=1.0, help='the ratio/additional digital gain you would like to add on the image, DEFAULT: 1.0.')
     parser.add_argument('--target_exposure', type=float, help='Target exposure, activate this will deactivate ratio.')
-    parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output png file, DEFAULT: 16.')
+    parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output dng file, DEFAULT: 16.')
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
     args = parser.parse_args()
 
