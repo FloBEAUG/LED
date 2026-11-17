@@ -40,6 +40,8 @@ def load_network(net, load_path, strict=True, param_key='params'):
 
 
 def get_available_device():
+    if torch.cuda.is_available():
+        return torch.device('cuda')
     return torch.device('cpu')
 
 
@@ -52,7 +54,8 @@ def read_img(raw, raw_path):
     if raw.camera_white_level_per_channel is None:
         white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
     else:
-        white_level = np.array(raw.camera_white_level_per_channel, dtype='float32').reshape(1, 4, 1, 1)
+        white_level = np.array(raw.camera_white_level_per_channel,
+                                    dtype='float32').reshape(1, 4, 1, 1)
 
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
@@ -80,12 +83,62 @@ def read_img(raw, raw_path):
     return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
 
 
-def postprocess(raw, im, bl, wl, output_bps=16):
-    im = im * (wl - bl) + bl
+def postprocess_to_full_bayer(result_tensor, bl, wl, raw_pattern):
+    """Convert denoised packed tensor (1, 4, H/2, W/2) to full Bayer uint16 (H, W).
+
+    Mirrors the denormalize + depack logic of postprocess() but returns
+    a numpy array instead of writing into raw.raw_image_visible.
+
+    raw_pattern: the raw Bayer pattern array from rawpy (values 0=R,1=G1,2=B,3=G2).
+    """
+    im = result_tensor * (wl - bl) + bl
     im = im.numpy()[0]
-    im = depack_raw_bayer(im, raw.raw_pattern)
-    H, W = im.shape
-    raw.raw_image_visible[:H, :W] = im
+    full = depack_raw_bayer(im, raw_pattern)
+    return full
+
+
+def run_inference_tiled(network_g, im_norm, device, margin=16):
+    """Run inference with quadrant tiling + margin to avoid OOM on large images.
+
+    im_norm: packed bayer tensor (1, 4, H, W) at half resolution.
+    Returns: denoised packed tensor (1, 4, H, W) on CPU.
+    """
+    h, w = im_norm.shape[2], im_norm.shape[3]
+    h_half, w_half = h // 2, w // 2
+
+    # If image is small enough, run directly on GPU
+    if h <= 2048 and w <= 2048:
+        with torch.no_grad():
+            result = network_g(im_norm.to(device))
+        return result.clip(0, 1).cpu()
+
+    out = torch.zeros_like(im_norm)
+
+    # Top-left quadrant: output [0:h_half, 0:w_half] from tile [0:h_half+margin, 0:w_half+margin]
+    tile = im_norm[:, :, 0:h_half + margin, 0:w_half + margin].to(device)
+    with torch.no_grad():
+        res = network_g(tile).clip(0, 1).cpu()
+    out[:, :, 0:h_half, 0:w_half] = res[:, :, 0:h_half, 0:w_half]
+
+    # Top-right quadrant: output [0:h_half, w_half:w] from tile [0:h_half+margin, w_half-margin:w]
+    tile = im_norm[:, :, 0:h_half + margin, w_half - margin:w].to(device)
+    with torch.no_grad():
+        res = network_g(tile).clip(0, 1).cpu()
+    out[:, :, 0:h_half, w_half:w] = res[:, :, 0:h_half, margin:]
+
+    # Bottom-left quadrant: output [h_half:h, 0:w_half] from tile [h_half-margin:h, 0:w_half+margin]
+    tile = im_norm[:, :, h_half - margin:h, 0:w_half + margin].to(device)
+    with torch.no_grad():
+        res = network_g(tile).clip(0, 1).cpu()
+    out[:, :, h_half:h, 0:w_half] = res[:, :, margin:, 0:w_half]
+
+    # Bottom-right quadrant: output [h_half:h, w_half:w] from tile [h_half-margin:h, w_half-margin:w]
+    tile = im_norm[:, :, h_half - margin:h, w_half - margin:w].to(device)
+    with torch.no_grad():
+        res = network_g(tile).clip(0, 1).cpu()
+    out[:, :, h_half:h, w_half:w] = res[:, :, margin:, margin:]
+
+    return out
 
 
 @torch.no_grad()
@@ -99,14 +152,19 @@ def image_process():
     parser.add_argument('--target_exposure', type=float, help='Target exposure, activate this will deactivate ratio.')
     parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output dng file, DEFAULT: 16.')
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
+    parser.add_argument('--margin', type=int, default=16, help='tile margin in pixels for GPU tiled inference, DEFAULT: 16.')
     args = parser.parse_args()
 
     print('Building network...')
     network_g = build_network(yaml_load(args.network_options)['network_g'])
     print('Loading checkpoint...')
     load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
+
     device = get_available_device()
+    print(f'Using device: {device}')
     network_g = network_g.to(device)
+    network_g.eval()
+
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
@@ -117,23 +175,51 @@ def image_process():
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
             im, bl, wl, wb, ccms, cfa, cfa_size = read_img(raw, raw_path)
-            im = (im - bl) / (raw.white_level - bl)
-            im = (im * ratio).clip(max=torch.tensor(1.0))
+            im_norm = (im - bl) / (raw.white_level - bl)
+            im_norm = im_norm.clip(max=torch.tensor(1.0))
 
-            im = im.to(device)
-            result = network_g(im)
-            result = result.clip(0, 1).cpu()
+            # Keep a backup of the full sensor raw_image (includes border pixels)
+            # for DNG output. raw.raw_image_visible shares memory with raw.raw_image.
+            raw_image_backup = raw.raw_image.copy()
 
-            postprocess(raw, result, bl, raw.white_level, args.bps)
-            #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
-            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
+            # ===== CPU inference (full image, no tiling) =====
+            network_g_cpu = network_g.cpu()
+            result_cpu = network_g_cpu(im_norm)
+            result_cpu = result_cpu.clip(0, 1)
 
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size)
-            with exiftool.ExifTool() as et:
-                et.execute(b"-overwrite_original",
-                            f"-tagsFromFile={raw_path}".encode("utf-8"),
-                            b"-all:all",
-                            output_name.encode("utf-8"))
+            full_bayer_cpu = postprocess_to_full_bayer(result_cpu, bl, wl, raw.raw_pattern)
+            raw.raw_image_visible[:full_bayer_cpu.shape[0], :full_bayer_cpu.shape[1]] = full_bayer_cpu
+
+            cpu_output_name = os.path.join(args.save_path,
+                                          pathlib.Path(raw_path).stem + "_denoised_cpu.dng")
+            save_as_dng(raw.raw_image, cpu_output_name, args.bps, bl, wl,
+                        wb, ccms, cfa, cfa_size)
+
+            # Restore raw_image from backup before GPU pass
+            raw.raw_image[:] = raw_image_backup
+
+            # ===== GPU inference with tiling + margin =====
+            network_g = network_g.to(device)
+            result_gpu = run_inference_tiled(network_g, im_norm, device, margin=args.margin)
+            result_gpu = result_gpu.clip(0, 1)
+
+            full_bayer_gpu = postprocess_to_full_bayer(result_gpu, bl, wl, raw.raw_pattern)
+            raw.raw_image_visible[:full_bayer_gpu.shape[0], :full_bayer_gpu.shape[1]] = full_bayer_gpu
+
+            gpu_output_name = os.path.join(args.save_path,
+                                          pathlib.Path(raw_path).stem + "_denoised_gpu.dng")
+            save_as_dng(raw.raw_image, gpu_output_name, args.bps, bl, wl,
+                        wb, ccms, cfa, cfa_size)
+
+            # Copy tags from source to both DNGs
+            for out_path in (cpu_output_name, gpu_output_name):
+                with exiftool.ExifTool() as et:
+                    et.execute(b"-overwrite_original",
+                                f"-tagsFromFile={raw_path}".encode("utf-8"),
+                                b"-all:all",
+                                out_path.encode("utf-8"))
+
+            print(f'Saved: {os.path.basename(cpu_output_name)}  {os.path.basename(gpu_output_name)}')
 
 
 if __name__ == '__main__':
