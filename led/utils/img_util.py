@@ -274,9 +274,16 @@ def save_dng(raw_image, file_path, bpp=16, black_level=None, white_level=None, w
     height, width = raw_image.shape
 
     if metadata is not None:
-        cfa_pattern = metadata['cfa_pattern']
+        cfa_pattern = metadata['cfa_pattern']  # e.g. [0, 1, 3, 2] for RGGB
         cfa_size = metadata['cfa_size']
-        bl = metadata['black_level'] if black_level is None else np.asarray(black_level, dtype='float32')
+        # raw.black_level_per_channel order: [R, G1, B, G2].
+        # DNG BlackLevel order follows CFAPattern plane order [0,1,3,2] = [R,G1,G2,B].
+        # Reorder so BlackLevel[i] matches the i-th CFA plane.
+        bl_per_ch = metadata['black_level']  # [R, G1, B, G2]
+        bl = np.array([bl_per_ch[0], bl_per_ch[1], bl_per_ch[3], bl_per_ch[2]],
+                      dtype='float32')  # [R, G1, G2, B] matching CFAPattern [0,1,3,2]
+        if black_level is not None:
+            bl = np.asarray(black_level, dtype='float32').reshape(-1)
         wl = metadata['white_level'] if white_level is None else np.asarray(white_level, dtype='float32')
         wb_vals = metadata['wb'] if wb is None else np.asarray(wb, dtype='float32')
         make = metadata.get('make', 'Unknown')
@@ -316,17 +323,20 @@ def save_dng(raw_image, file_path, bpp=16, black_level=None, white_level=None, w
             np.array([12649, 10000, -6460, 10000, -13, 10000, -3506, 10000, 10855, 10000,
                       3061, 10000, -100, 10000, 741, 10000, 7311, 10000], dtype='float32'))
 
-    # AsShotNeutral: [r/g, 10000, b/g, 10000] style pairs (3 pairs).
+    # AsShotNeutral: [g1/r, g1/g2, g2/b] style pairs (matches read_img in
+    # scripts/image_process.py). wb_vals is flat [R, G1, B, G2] from metadata.
     if wb_vals.ndim == 2 and wb_vals.shape == (3, 2):
         # already in [[num, denom], ...] AsShotNeutral pair format
         as_shot_neutral = [[int(round(float(v[0]))), int(v[1])] for v in wb_vals]
     else:
         wb_flat = wb_vals.reshape(-1)
-        g = wb_flat[1] if wb_flat.size > 1 and wb_flat[1] != 0 else 1.0
         r = wb_flat[0] if wb_flat.size > 0 else 1.0
+        g = wb_flat[1] if wb_flat.size > 1 and wb_flat[1] != 0 else 1.0
         b = wb_flat[2] if wb_flat.size > 2 else 1.0
-        as_shot_neutral = [[int(round(r / g * 10000)), 10000], [10000, 10000],
-                           [int(round(b / g * 10000)), 10000]]
+        g2 = wb_flat[3] if wb_flat.size > 3 else g
+        as_shot_neutral = [[int(round(g / r * 10000)), 10000],
+                           [int(round(g / g2 * 10000)), 10000],
+                           [int(round(g2 / b * 10000)), 10000]]
 
     # Black level as list of 4 ints.
     black_level_list = [int(round(float(v))) for v in bl[:4]]
