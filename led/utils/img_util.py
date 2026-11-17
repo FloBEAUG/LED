@@ -199,10 +199,10 @@ def get_dng_metadata(raw_path):
         metadata['height'], metadata['width'] = raw.raw_image_visible.shape
         metadata['black_level'] = np.array(raw.black_level_per_channel, dtype='float32').reshape(4)
 
-        if raw.camera_white_level_per_channel is not None:
-            metadata['white_level'] = float(np.mean(raw.camera_white_level_per_channel))
-        else:
-            metadata['white_level'] = float(raw.white_level)
+        # Use the sensor's raw.white_level (e.g. 16383 for 14-bit), not the
+        # per-channel camera_white_level_per_channel mean, so the DNG data
+        # range matches the WhiteLevel tag.
+        metadata['white_level'] = float(raw.white_level)
 
         metadata['wb'] = np.array(raw.camera_whitebalance, dtype='float32')
 
