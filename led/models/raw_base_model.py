@@ -6,7 +6,8 @@ from tqdm import tqdm
 from led.metrics import calculate_metric
 
 from led.models.raw_denoising_utils import IlluminanceCorrect
-from led.utils import get_root_logger, imwrite, tensor2img
+from led.utils import (get_root_logger, imwrite, save_dng, tensor2img,
+                       tensor_to_bayer_dng, get_dng_metadata)
 from led.utils.process import load_CRF, raw2rgb_torch
 from .base_model import BaseModel
 
@@ -150,6 +151,38 @@ class RAWBaseModel(BaseModel):
                         imwrite(sr_imgs, save_img_path)
                     else:
                         raise NotImplementedError()
+
+            if self.opt['val'].get('save_dng', False) and not self.calculate_metric_in_batch:
+                bpp = self.opt['val'].get('dng_bpp', 16)
+                packed = self.output.detach().cpu().numpy()[0]
+                if hasattr(self, 'black_level') and hasattr(self, 'white_level'):
+                    bl = self.black_level.detach().cpu().numpy().reshape(4)
+                    wl = float(self.white_level.detach().cpu().numpy().mean())
+                else:
+                    bl = None
+                    wl = None
+                raw_path = val_data['lq_path'][0]
+                metadata = get_dng_metadata(raw_path)
+                if bl is None:
+                    bl = metadata['black_level']
+                if wl is None:
+                    wl = metadata['white_level']
+                full_bayer = tensor_to_bayer_dng(
+                    torch.from_numpy(packed), bl, wl, metadata['cfa_pattern'])
+                if self.opt['is_train']:
+                    save_dng_path = osp.join(self.opt['path']['visualization'], img_name,
+                                            f'{img_name}_{current_iter}.dng')
+                else:
+                    if self.opt['val']['suffix']:
+                        save_dng_path = osp.join(self.opt['path']['visualization'], dataset_name,
+                                                f'{img_name}_{self.opt["val"]["suffix"]}.dng')
+                    else:
+                        save_dng_path = osp.join(self.opt['path']['visualization'], dataset_name,
+                                                f'{img_name}_{self.opt["name"]}.dng')
+                save_dng(full_bayer, save_dng_path, bpp=bpp, black_level=bl,
+                         white_level=wl, wb=metadata['wb'], ccms=None, metadata=metadata)
+                logger = get_root_logger()
+                logger.info(f'Saved DNG: {save_dng_path}')
 
             if with_metrics:
                 # calculate metrics
