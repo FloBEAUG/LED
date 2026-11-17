@@ -39,8 +39,8 @@ def load_network(net, load_path, strict=True, param_key='params'):
     net.load_state_dict(load_net, strict=strict)
 
 
-def get_available_device():
-    if torch.cuda.is_available():
+def get_available_device(force_cpu=False):
+    if not force_cpu and torch.cuda.is_available():
         return torch.device('cuda')
     return torch.device('cpu')
 
@@ -152,7 +152,8 @@ def image_process():
     parser.add_argument('--target_exposure', type=float, help='Target exposure, activate this will deactivate ratio.')
     parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output dng file, DEFAULT: 16.')
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
-    parser.add_argument('--margin', type=int, default=16, help='tile margin in pixels for GPU tiled inference, DEFAULT: 16.')
+    parser.add_argument('--cpu', action='store_true', help='force CPU inference (no GPU). Default: use GPU if available.')
+    parser.add_argument('--margin', type=int, default=32, help='tile margin in pixels for GPU tiled inference, DEFAULT: 32.')
     args = parser.parse_args()
 
     print('Building network...')
@@ -160,7 +161,7 @@ def image_process():
     print('Loading checkpoint...')
     load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
 
-    device = get_available_device()
+    device = get_available_device(force_cpu=args.cpu)
     print(f'Using device: {device}')
     network_g = network_g.to(device)
     network_g.eval()
@@ -168,6 +169,8 @@ def image_process():
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
+
+    suffix = '_cpu' if args.cpu else '_gpu'
 
     for raw_path in tqdm(raw_paths):
         if args.target_exposure is not None:
@@ -178,48 +181,40 @@ def image_process():
             im_norm = (im - bl) / (raw.white_level - bl)
             im_norm = im_norm.clip(max=torch.tensor(1.0))
 
-            # Keep a backup of the full sensor raw_image (includes border pixels)
-            # for DNG output. raw.raw_image_visible shares memory with raw.raw_image.
-            raw_image_backup = raw.raw_image.copy()
+            if args.cpu:
+                # CPU inference (full image, no tiling)
+                network_g_cpu = network_g.cpu()
+                result_cpu = network_g_cpu(im_norm)
+                result_cpu = result_cpu.clip(0, 1)
 
-            # ===== CPU inference (full image, no tiling) =====
-            network_g_cpu = network_g.cpu()
-            result_cpu = network_g_cpu(im_norm)
-            result_cpu = result_cpu.clip(0, 1)
+                full_bayer = postprocess_to_full_bayer(result_cpu, bl, wl, raw.raw_pattern)
+                raw.raw_image_visible[:full_bayer.shape[0], :full_bayer.shape[1]] = full_bayer
 
-            full_bayer_cpu = postprocess_to_full_bayer(result_cpu, bl, wl, raw.raw_pattern)
-            raw.raw_image_visible[:full_bayer_cpu.shape[0], :full_bayer_cpu.shape[1]] = full_bayer_cpu
+                output_name = os.path.join(args.save_path,
+                                          pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
+                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                            wb, ccms, cfa, cfa_size)
+            else:
+                # GPU inference with tiling + margin
+                result_gpu = run_inference_tiled(network_g, im_norm, device, margin=args.margin)
+                result_gpu = result_gpu.clip(0, 1)
 
-            cpu_output_name = os.path.join(args.save_path,
-                                          pathlib.Path(raw_path).stem + "_denoised_cpu.dng")
-            save_as_dng(raw.raw_image, cpu_output_name, args.bps, bl, wl,
-                        wb, ccms, cfa, cfa_size)
+                full_bayer = postprocess_to_full_bayer(result_gpu, bl, wl, raw.raw_pattern)
+                raw.raw_image_visible[:full_bayer.shape[0], :full_bayer.shape[1]] = full_bayer
 
-            # Restore raw_image from backup before GPU pass
-            raw.raw_image[:] = raw_image_backup
+                output_name = os.path.join(args.save_path,
+                                          pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
+                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                            wb, ccms, cfa, cfa_size)
 
-            # ===== GPU inference with tiling + margin =====
-            network_g = network_g.to(device)
-            result_gpu = run_inference_tiled(network_g, im_norm, device, margin=args.margin)
-            result_gpu = result_gpu.clip(0, 1)
+            # Copy tags from source to DNG
+            with exiftool.ExifTool() as et:
+                et.execute(b"-overwrite_original",
+                            f"-tagsFromFile={raw_path}".encode("utf-8"),
+                            b"-all:all",
+                            output_name.encode("utf-8"))
 
-            full_bayer_gpu = postprocess_to_full_bayer(result_gpu, bl, wl, raw.raw_pattern)
-            raw.raw_image_visible[:full_bayer_gpu.shape[0], :full_bayer_gpu.shape[1]] = full_bayer_gpu
-
-            gpu_output_name = os.path.join(args.save_path,
-                                          pathlib.Path(raw_path).stem + "_denoised_gpu.dng")
-            save_as_dng(raw.raw_image, gpu_output_name, args.bps, bl, wl,
-                        wb, ccms, cfa, cfa_size)
-
-            # Copy tags from source to both DNGs
-            for out_path in (cpu_output_name, gpu_output_name):
-                with exiftool.ExifTool() as et:
-                    et.execute(b"-overwrite_original",
-                                f"-tagsFromFile={raw_path}".encode("utf-8"),
-                                b"-all:all",
-                                out_path.encode("utf-8"))
-
-            print(f'Saved: {os.path.basename(cpu_output_name)}  {os.path.basename(gpu_output_name)}')
+            print(f'Saved: {os.path.basename(output_name)}')
 
 
 if __name__ == '__main__':
