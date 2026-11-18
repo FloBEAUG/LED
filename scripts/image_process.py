@@ -69,9 +69,9 @@ def read_img(raw, raw_path):
 
     r, g1, b, g2 = np.array(np.array(raw.camera_whitebalance, dtype='float32') * 10000, dtype=np.uint)
     if g2 != 0:
-        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g2 * 10000), 10000], [int(g2/b * 10000), 10000]]
+        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g2 * 10000), 10000], [int(g1/b * 10000), 10000]]
     else:
-        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g1 * 10000), 10000], [int(g2/b * 10000), 10000]]
+        white_balance = [[int(g1/r * 10000), 10000], [int(g1/g1 * 10000), 10000], [int(g1/b * 10000), 10000]]
 
     cfa_pattern_size = list(raw.raw_pattern.shape)
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
