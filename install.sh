@@ -4,8 +4,8 @@ set -e
 # setting conda hook
 eval "$(conda shell.bash hook)"
 # create env
-conda create -y -n LED-ICCV23 python=3.8
-conda activate LED-ICCV23
+conda create -y -n LED-ICCV23-cu12 python=3.12
+conda activate LED-ICCV23-cu12
 # install packages
 pip install -r requirements.txt
 python setup.py develop

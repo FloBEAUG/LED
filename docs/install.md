@@ -13,8 +13,8 @@ To install the packages required by our LED, you could :
 
 1. Create a virtual enviorment and activate it:
    ```bash
-   conda create -y -n LED-ICCV23 python=3.8
-   conda activate LED-ICCV23
+   conda create -y -n LED-ICCV23-cu12 python=3.12
+   conda activate LED-ICCV23-cu12
    ```
 2. Install the prerequisite packages:
    ```bash

@@ -89,7 +89,7 @@ Achieveing <b style='font-size: large'>SOTA performance</b> in <b style='font-si
    ```
 3. Activate your env and start testing!
    ```bash
-   conda activate LED-ICCV23
+   conda activate LED-ICCV23-cu12
    ```
 
 ## :sparkles: Pretrained Models
