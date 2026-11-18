@@ -78,29 +78,43 @@ def read_img(raw, raw_path):
     cfa_pattern_size = list(raw.raw_pattern.shape)
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
     raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
-
-    color_matrices = []
-    if np.array(raw.rgb_xyz_matrix).any():
-        color_matrices.append(np.array(raw.rgb_xyz_matrix[:3]).flatten())
-    else:
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix1'], dtype='float32', sep= ' '))
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix2'], dtype='float32', sep= ' '))
-
-    for i in range(len(color_matrices)):
-        color_matrices[i] = [[int(round(x * 10000)), 10000] for x in color_matrices[i]]
-        
-    
-    
+    color_matrices = _extract_ccms(metadata)
 
     return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
 
 
+def _extract_ccms(metadata):
+    """Extract Color Correction Matrices from source file metadata.
+
+    Priority:
+      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
+      2. Hardcoded defaults if not present in source
+
+    Returns:
+        list of 2 matrices, each as list of 9 [num, denom] pairs
+    """
+    DEFAULT_CCM1 = [[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000],
+                     [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]]
+    DEFAULT_CCM2 = [[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000],
+                     [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]]
+
+    cm1 = metadata[0].get('EXIF:ColorMatrix1')
+    cm2 = metadata[0].get('EXIF:ColorMatrix2')
+
+    if cm1 is not None:
+        cm1_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm1, dtype='float32', sep=' ')]
+    else:
+        cm1_parsed = DEFAULT_CCM1
+
+    if cm2 is not None:
+        cm2_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm2, dtype='float32', sep=' ')]
+    else:
+        cm2_parsed = DEFAULT_CCM2
+
+    return [cm1_parsed, cm2_parsed]
+
 def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     height, width = rawImage.shape
-
-    ccms = []
-    ccms.append([[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000], [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]])
-    ccms.append([[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000], [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]])
 
     fwms = []
     fwms.append([[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]])
