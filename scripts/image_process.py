@@ -57,12 +57,9 @@ def read_img(raw, raw_path):
     black_level = np.array(raw.black_level_per_channel,
                                     dtype='float32').reshape(1,4, 1, 1)
 
-    if raw.camera_white_level_per_channel is None:
-        white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
-
-    else:
-        white_level = np.array(raw.camera_white_level_per_channel,
-                                    dtype='float32').reshape(1,4, 1, 1)
+    # Always use raw.white_level (sensor saturation) for DNG WhiteLevel tag,
+    # not camera_white_level_per_channel which may be lower.
+    white_level = np.array([raw.white_level] * 4, dtype='float32').reshape(4, 1, 1)
 
     black_level = torch.from_numpy(black_level).contiguous()
     white_level = torch.from_numpy(white_level).contiguous()
@@ -347,7 +344,10 @@ def image_process():
         with rawpy.imread(raw_path) as raw:
             im, bl, wl, wb, ccms, cfa, cfa_size, active_area, make, model, fwms = read_img(raw, raw_path)
 
-            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_raw{suffix}.dng')
+            if args.no_denoise:
+                output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_raw{suffix}.dng')
+            else:
+                output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
 
             if args.no_denoise:
                 # Passthrough mode: save raw image as-is without denoising
