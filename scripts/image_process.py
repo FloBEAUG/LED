@@ -76,31 +76,53 @@ def read_img(raw, raw_path):
         white_balance = [[int(g1/r * 10000), 10000], [int(g1/g1 * 10000), 10000], [int(g2/b * 10000), 10000]]
 
     cfa_pattern_size = list(raw.raw_pattern.shape)
-    cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
+    cfa_pattern = [int(x) for x in raw.raw_pattern.flatten()]
     raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
+    color_matrices = _extract_ccms(metadata)
 
-    color_matrices = []
-    if np.array(raw.rgb_xyz_matrix).any():
-        color_matrices.append(np.array(raw.rgb_xyz_matrix[:3]).flatten())
+    make = metadata[0].get('EXIF:Make', 'Unknown')
+    model = metadata[0].get('EXIF:Model', 'Unknown')
+
+
+    
+
+    
+
+    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size, make, model
+
+
+def _extract_ccms(metadata):
+    """Extract Color Correction Matrices from source file metadata.
+
+    Priority:
+      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
+      2. Hardcoded defaults if not present in source
+
+    Returns:
+        list of 2 matrices, each as list of 9 [num, denom] pairs
+    """
+    DEFAULT_CCM1 = [[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000],
+                     [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]]
+    DEFAULT_CCM2 = [[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000],
+                     [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]]
+
+    cm1 = metadata[0].get('EXIF:ColorMatrix1')
+    cm2 = metadata[0].get('EXIF:ColorMatrix2')
+
+    if cm1 is not None:
+        cm1_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm1, dtype='float32', sep=' ')]
     else:
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix1'], dtype='float32', sep= ' '))
-        color_matrices.append(np.fromstring(metadata[0]['EXIF:ColorMatrix2'], dtype='float32', sep= ' '))
+        cm1_parsed = DEFAULT_CCM1
 
-    for i in range(len(color_matrices)):
-        color_matrices[i] = [[int(round(x * 10000)), 10000] for x in color_matrices[i]]
-        
-    
-    
+    if cm2 is not None:
+        cm2_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm2, dtype='float32', sep=' ')]
+    else:
+        cm2_parsed = DEFAULT_CCM2
 
-    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
+    return [cm1_parsed, cm2_parsed]
 
-
-def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, make='Unknown', model='Unknown'):
     height, width = rawImage.shape
-
-    ccms = []
-    ccms.append([[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000], [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]])
-    ccms.append([[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000], [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]])
 
     fwms = []
     fwms.append([[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]])
@@ -114,7 +136,7 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     t = DNGTags()
     t.set(Tag.ImageWidth, width)
     t.set(Tag.ImageLength, height)
-    t.set(Tag.ActiveArea, [72, 144, 4732, 7128])
+    t.set(Tag.ActiveArea, [0, 0, height, width])
     t.set(Tag.TileWidth, width)
     t.set(Tag.TileLength, height)
     t.set(Tag.Orientation, Orientation.Horizontal)
@@ -138,8 +160,8 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.D65)
     t.set(Tag.AsShotNeutral, wb)
     #t.set(Tag.BaselineExposure, [[35, 100]])
-    t.set(Tag.Make, "Canon")
-    t.set(Tag.Model, "EOS R7")
+    t.set(Tag.Make, str(make))
+    t.set(Tag.Model, str(model))
     t.set(Tag.DNGVersion, DNGVersion.V1_6)
     t.set(Tag.DNGBackwardVersion, DNGVersion.V1_4)
     t.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
@@ -185,7 +207,7 @@ def image_process():
             iso, exp_time = metainfo(raw_path)
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
-            im, bl, wl, wb, ccms, cfa, cfa_size = read_img(raw, raw_path)
+            im, bl, wl, wb, ccms, cfa, cfa_size, make, model = read_img(raw, raw_path)
             im = (im - bl) / (raw.white_level - bl)
             im = (im * ratio).clip(max=torch.tensor(1.0))
 
@@ -214,7 +236,7 @@ def image_process():
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
             output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
             
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size)
+            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size, make=make, model=model)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
