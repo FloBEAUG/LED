@@ -77,8 +77,49 @@ def read_img(raw, raw_path):
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
     raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
     color_matrices = _extract_ccms(metadata)
+    active_area = _get_active_area(raw)
 
-    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size
+    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size, active_area
+
+
+def _get_active_area(raw):
+    """Find where raw.raw_image_visible sits within raw.raw_image.
+
+    Returns [top, left, bottom, right] for the DNG ActiveArea tag.
+    The full raw_image (including black border) is written to the DNG,
+    but ActiveArea tells decoders which region is the visible image.
+    """
+    ri = raw.raw_image
+    riv = raw.raw_image_visible
+    ri_h, ri_w = ri.shape
+    riv_h, riv_w = riv.shape
+
+    # Try memory-address approach first (rawpy returns views)
+    try:
+        ri_data = ri.ctypes.data
+        riv_data = riv.ctypes.data
+        byte_offset = riv_data - ri_data
+        itemsize = ri.dtype.itemsize
+        elem_offset = byte_offset // itemsize
+        left = elem_offset % ri_w
+        top = elem_offset // ri_w
+        if 0 <= top < ri_h and 0 <= left < ri_w:
+            # Verify
+            if np.array_equal(ri[top:top+riv_h, left:left+riv_w], riv):
+                return [top, left, top + riv_h, left + riv_w]
+    except Exception:
+        pass
+
+    # Fallback: search for the visible array within the full image
+    target_first = riv[0, 0]
+    for row in range(ri_h - riv_h + 1):
+        for col in range(ri_w - riv_w + 1):
+            if ri[row, col] == target_first:
+                if np.array_equal(ri[row:row+riv_h, col:col+riv_w], riv):
+                    return [row, col, row + riv_h, col + riv_w]
+
+    # Last resort: assume visible starts at 0,0
+    return [0, 0, riv_h, riv_w]
 
 
 def _extract_ccms(metadata):
@@ -111,7 +152,7 @@ def _extract_ccms(metadata):
 
     return [cm1_parsed, cm2_parsed]
 
-def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, active_area):
     height, width = rawImage.shape
 
     fwms = []
@@ -126,7 +167,7 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size):
     t = DNGTags()
     t.set(Tag.ImageWidth, width)
     t.set(Tag.ImageLength, height)
-    t.set(Tag.ActiveArea, [0, 0, height, width])
+    t.set(Tag.ActiveArea, active_area)
     t.set(Tag.TileWidth, width)
     t.set(Tag.TileLength, height)
     t.set(Tag.Orientation, Orientation.Horizontal)
@@ -198,7 +239,7 @@ def image_process():
             iso, exp_time = metainfo(raw_path)
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
-            im, bl, wl, wb, ccms, cfa, cfa_size = read_img(raw, raw_path)
+            im, bl, wl, wb, ccms, cfa, cfa_size, active_area = read_img(raw, raw_path)
             im = (im - bl) / (raw.white_level - bl)
             im = (im * ratio).clip(max=torch.tensor(1.0))
 
@@ -227,7 +268,7 @@ def image_process():
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
             output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
             
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size)
+            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size, active_area)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
