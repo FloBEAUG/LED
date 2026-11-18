@@ -322,6 +322,7 @@ def image_process():
     parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output png file, DEFAULT: 16.')
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
     parser.add_argument('--cpu', action='store_true', help='force CPU inference (no GPU tiling). Default: use GPU if available.')
+    parser.add_argument('--no-denoise', action='store_true', help='skip denoising, output raw image as DNG for color comparison.')
     args = parser.parse_args()
 
     print('Building network...')
@@ -336,6 +337,8 @@ def image_process():
     os.makedirs(args.save_path, exist_ok=True)
 
     suffix = '_cpu' if args.cpu else '_gpu'
+    if args.no_denoise:
+        suffix = '_raw'
 
     for raw_path in tqdm(raw_paths):
         if args.target_exposure is not None:
@@ -343,19 +346,28 @@ def image_process():
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
             im, bl, wl, wb, ccms, cfa, cfa_size, active_area, make, model, fwms = read_img(raw, raw_path)
-            im = (im - bl) / (raw.white_level - bl)
-            im = (im * ratio).clip(max=torch.tensor(1.0))
 
-            im = im.to(device)
-            result = network_g(im)
-            result = result.clip(0, 1).cpu()
+            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_raw{suffix}.dng')
 
-            postprocess(raw, result, bl, raw.white_level, args.bps)
-            #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
-            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
-            
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size,
-                        active_area, make=make, model=model, fwms=fwms)
+            if args.no_denoise:
+                # Passthrough mode: save raw image as-is without denoising
+                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                            wb, ccms, cfa, cfa_size,
+                            active_area, make=make, model=model, fwms=fwms)
+            else:
+                im_norm = (im - bl) / (raw.white_level - bl)
+                im_norm = im_norm.clip(max=torch.tensor(1.0))
+
+                im_norm = im_norm.to(device)
+                result = network_g(im_norm)
+                result = result.clip(0, 1).cpu()
+
+                postprocess(raw, result, bl, raw.white_level, args.bps)
+
+                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                            wb, ccms, cfa, cfa_size,
+                            active_area, make=make, model=model, fwms=fwms)
+
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
