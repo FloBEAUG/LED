@@ -43,11 +43,9 @@ def load_network(net, load_path, strict=True, param_key='params'):
     net.load_state_dict(load_net, strict=strict)
 
 
-def get_available_device():
-    # if torch.cuda.is_available():
-    #     return torch.device('cuda')
-    # if torch.backends.mps.is_available():
-    #     return torch.device('mps')
+def get_available_device(force_cpu=False):
+    if not force_cpu and torch.cuda.is_available():
+        return torch.device('cuda')
     return torch.device('cpu')
 
 
@@ -182,13 +180,14 @@ def image_process():
     parser.add_argument('--target_exposure', type=float, help='Target exposure, activate this will deactivate ratio.')
     parser.add_argument('--bps', '--output_bps', type=int, default=16, help='the bit depth for the output png file, DEFAULT: 16.')
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
+    parser.add_argument('--cpu', action='store_true', help='force CPU inference (no GPU tiling). Default: use GPU if available.')
     args = parser.parse_args()
 
     print('Building network...')
     network_g = build_network(yaml_load(args.network_options)['network_g'])
     print('Loading checkpoint...')
     load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
-    device = get_available_device()
+    device = get_available_device(force_cpu=args.cpu)
     network_g = network_g.to(device)
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
