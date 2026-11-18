@@ -17,6 +17,7 @@ import pathlib
 import exiftool
 import cv2
 
+
 def load_network(net, load_path, strict=True, param_key='params'):
     """Load network.
 
@@ -53,7 +54,6 @@ def read_img(raw, raw_path):
     with exiftool.ExifToolHelper() as et:
         metadata = et.get_metadata(raw_path)
 
-
     black_level = np.array(raw.black_level_per_channel,
                                     dtype='float32').reshape(1,4, 1, 1)
 
@@ -76,10 +76,12 @@ def read_img(raw, raw_path):
     cfa_pattern_size = list(raw.raw_pattern.shape)
     cfa_pattern = [int(x) if x != 3 else 1 for x in raw.raw_pattern.flatten()]
     raw_packed = torch.from_numpy(np.float32(pack_raw_bayer(raw.raw_image_visible, raw.raw_pattern))[np.newaxis]).contiguous()
-    color_matrices = _extract_ccms(metadata)
+    color_matrices, forward_matrices = _extract_ccms(raw, metadata)
     active_area = _get_active_area(raw)
+    make = metadata[0].get('EXIF:Make', 'Unknown')
+    model = metadata[0].get('EXIF:Model', 'Unknown')
 
-    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size, active_area
+    return raw_packed, black_level, white_level, white_balance, color_matrices, cfa_pattern, cfa_pattern_size, active_area, make, model, forward_matrices
 
 
 def _get_active_area(raw):
@@ -122,46 +124,147 @@ def _get_active_area(raw):
     return [0, 0, riv_h, riv_w]
 
 
-def _extract_ccms(metadata):
-    """Extract Color Correction Matrices from source file metadata.
+def _matrix_to_pairs(mat):
+    """Convert a 3x3 numpy matrix to DNG rational pairs format [[num, denom], ...]."""
+    pairs = []
+    for row in mat:
+        for v in row:
+            # Convert to rational with denominator 10000
+            val = float(v)
+            num = int(round(val * 10000))
+            pairs.append([num, 10000])
+    return pairs
 
-    Priority:
-      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
-      2. Hardcoded defaults if not present in source
+
+def _matrices_from_rawpy(raw):
+    """Extract color matrices from rawpy rawpy object.
+
+    LibRaw's rgb_xyz_matrix = XYZ -> camera RGB (DNG ColorMatrix).
+    ForwardMatrix = camera RGB -> XYZ = inverse of ColorMatrix.
 
     Returns:
-        list of 2 matrices, each as list of 9 [num, denom] pairs
+        (color_matrices, forward_matrices): each is a list of 2 matrices
+        (for illuminant 1 and illuminant 2).
     """
     DEFAULT_CCM1 = [[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000],
                      [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]]
     DEFAULT_CCM2 = [[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000],
                      [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]]
 
-    cm1 = metadata[0].get('EXIF:ColorMatrix1')
-    cm2 = metadata[0].get('EXIF:ColorMatrix2')
+    cm1 = None
+    cm2 = None
 
+    # Try EXIF ColorMatrix1/2 first (e.g., from DNG source files like RN9P.dng)
+    cm1_raw = None
+    cm2_raw = None
+
+    # rawpy.rgb_xyz_matrix = XYZ -> camera RGB = ColorMatrix
+    if hasattr(raw, 'rgb_xyz_matrix') and raw.rgb_xyz_matrix is not None:
+        rxyz = np.array(raw.rgb_xyz_matrix[:3, :3], dtype=np.float64)
+        if np.any(rxyz):
+            cm1 = rxyz
+            cm2 = rxyz.copy()  # Same matrix for both illuminants if only one available
+
+    # Compute ForwardMatrix = inverse of ColorMatrix
     if cm1 is not None:
-        cm1_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm1, dtype='float32', sep=' ')]
+        try:
+            fm1 = np.linalg.inv(cm1)
+        except np.linalg.LinAlgError:
+            fm1 = np.eye(3)
+        fm2 = fm1.copy()
     else:
-        cm1_parsed = DEFAULT_CCM1
+        fm1 = None
+        fm2 = None
 
-    if cm2 is not None:
-        cm2_parsed = [[int(round(float(x) * 10000)), 10000] for x in np.fromstring(cm2, dtype='float32', sep=' ')]
+    # Convert to DNG rational pairs
+    if cm1 is not None:
+        ccms = [_matrix_to_pairs(cm1), _matrix_to_pairs(cm2)]
     else:
-        cm2_parsed = DEFAULT_CCM2
+        ccms = [DEFAULT_CCM1, DEFAULT_CCM2]
 
-    return [cm1_parsed, cm2_parsed]
+    if fm1 is not None:
+        fwms = [_matrix_to_pairs(fm1), _matrix_to_pairs(fm2)]
+    else:
+        # Default forward matrices (inverse of default CCM)
+        fwms = [[[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]],
+                [[4590, 10000], [2857, 10000], [2196, 10000], [2642, 10000], [6660, 10000], [698, 10000], [1219, 10000], [39, 10000], [6994, 10000]]]
 
-def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, active_area):
+    return ccms, fwms
+
+
+def _extract_ccms(raw, metadata):
+    """Extract Color Correction Matrices from source file metadata.
+
+    Priority:
+      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
+      2. rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
+      3. Hardcoded defaults
+
+    Returns:
+        (ccms, fwms): each is a list of 2 matrices
+        ccms[i] = ColorMatrix[i+1] (XYZ -> camera RGB)
+        fwms[i] = ForwardMatrix[i+1] (camera RGB -> XYZ)
+    """
+    DEFAULT_CCM1 = [[12649, 10000], [-6460, 10000], [-13, 10000], [-3506, 10000],
+                     [10855, 10000], [3061, 10000], [-100, 10000], [741, 10000], [7311, 10000]]
+    DEFAULT_CCM2 = [[10424, 10000], [-3138, 10000], [-1300, 10000], [-4221, 10000],
+                     [11938, 10000], [2584, 10000], [-547, 10000], [1658, 10000], [6183, 10000]]
+
+    cm1 = None
+    cm2 = None
+
+    # 1. Try EXIF ColorMatrix1/2 first (e.g., from DNG source files like RN9P.dng)
+    cm1_raw = metadata[0].get('EXIF:ColorMatrix1')
+    cm2_raw = metadata[0].get('EXIF:ColorMatrix2')
+
+    if cm1_raw is not None:
+        cm1_vals = np.fromstring(cm1_raw, dtype=np.float64, sep=' ')
+        if len(cm1_vals) >= 9:
+            cm1 = cm1_vals[:9].reshape(3, 3)
+
+    if cm2_raw is not None:
+        cm2_vals = np.fromstring(cm2_raw, dtype=np.float64, sep=' ')
+        if len(cm2_vals) >= 9:
+            cm2 = cm2_vals[:9].reshape(3, 3)
+
+    # 2. Fall back to rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
+    if cm1 is None:
+        if hasattr(raw, 'rgb_xyz_matrix') and raw.rgb_xyz_matrix is not None:
+            rxyz = np.array(raw.rgb_xyz_matrix[:3, :3], dtype=np.float64)
+            if np.any(rxyz):
+                cm1 = rxyz
+                cm2 = rxyz.copy()  # Same matrix for both illuminants if only one available
+
+    # 3. Compute ForwardMatrix = inverse of ColorMatrix
+    if cm1 is not None:
+        try:
+            fm1 = np.linalg.inv(cm1)
+        except np.linalg.LinAlgError:
+            fm1 = np.eye(3)
+        fm2 = np.linalg.inv(cm2) if cm2 is not None else fm1.copy()
+    else:
+        fm1 = None
+        fm2 = None
+
+    # Convert to DNG rational pairs
+    if cm1 is not None:
+        ccms = [_matrix_to_pairs(cm1), _matrix_to_pairs(cm2)]
+    else:
+        ccms = [DEFAULT_CCM1, DEFAULT_CCM2]
+
+    if fm1 is not None:
+        fwms = [_matrix_to_pairs(fm1), _matrix_to_pairs(fm2)]
+    else:
+        # Default forward matrices (inverse of default CCM)
+        fwms = [[[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]],
+                [[4590, 10000], [2857, 10000], [2196, 10000], [2642, 10000], [6660, 10000], [698, 10000], [1219, 10000], [39, 10000], [6994, 10000]]]
+
+    return ccms, fwms
+
+
+def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, active_area,
+                make='Unknown', model='Unknown', fwms=None):
     height, width = rawImage.shape
-
-    fwms = []
-    fwms.append([[4475, 10000], [3644, 10000], [1524, 10000], [2027, 10000], [7486, 10000], [486, 10000], [725, 10000], [14, 10000], [7513, 10000]])
-    fwms.append([[4590, 10000], [2857, 10000], [2196, 10000], [2642, 10000], [6660, 10000], [698, 10000], [1219, 10000], [39, 10000], [6994, 10000]])
-    
-    ccs = []
-    ccs.append([[10122, 10000], [0, 10000], [0, 10000], [0, 10000], [10000, 10000], [0, 10000], [0, 10000], [0, 10000], [9747, 10000]])
-    ccs.append([[10122, 10000], [0, 10000], [0, 10000], [0, 10000], [10000, 10000], [0, 10000], [0, 10000], [0, 10000], [9747, 10000]])
 
     # set DNG tags.
     t = DNGTags()
@@ -176,12 +279,9 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, active
     t.set(Tag.BitsPerSample, bpp)
     t.set(Tag.CFARepeatPatternDim, cfa_size)
     t.set(Tag.CFAPattern, cfa)
-    #t.set(Tag.CFAPlaneColor, [0, 1, 2])
-    #t.set(Tag.CFALayout, [1])
-    #t.set(Tag.ForwardMatrix1, fwms[0])
-    #t.set(Tag.ForwardMatrix2, fwms[1])
-    #t.set(Tag.CameraCalibration1, ccs[0])
-    #t.set(Tag.CameraCalibration2, ccs[1])
+    if fwms is not None:
+        t.set(Tag.ForwardMatrix1, fwms[0])
+        t.set(Tag.ForwardMatrix2, fwms[1])
     t.set(Tag.BlackLevelRepeatDim, [2, 2])
     t.set(Tag.BlackLevel, torch.reshape(bl, (-1,)).type(torch.int32).tolist())
     t.set(Tag.WhiteLevel, int(torch.mean(wl)))
@@ -191,8 +291,8 @@ def save_as_dng(rawImage, filename, bpp, bl, wl, wb, ccms, cfa, cfa_size, active
     t.set(Tag.CalibrationIlluminant2, CalibrationIlluminant.D65)
     t.set(Tag.AsShotNeutral, wb)
     #t.set(Tag.BaselineExposure, [[35, 100]])
-    t.set(Tag.Make, "Canon")
-    t.set(Tag.Model, "EOS R7")
+    t.set(Tag.Make, str(make))
+    t.set(Tag.Model, str(model))
     t.set(Tag.DNGVersion, DNGVersion.V1_6)
     t.set(Tag.DNGBackwardVersion, DNGVersion.V1_4)
     t.set(Tag.PreviewColorSpace, PreviewColorSpace.sRGB)
@@ -230,50 +330,40 @@ def image_process():
     load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
     device = get_available_device(force_cpu=args.cpu)
     network_g = network_g.to(device)
+    network_g.eval()
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
+
+    suffix = '_cpu' if args.cpu else '_gpu'
 
     for raw_path in tqdm(raw_paths):
         if args.target_exposure is not None:
             iso, exp_time = metainfo(raw_path)
             ratio = args.target_exposure / (iso * exp_time)
         with rawpy.imread(raw_path) as raw:
-            im, bl, wl, wb, ccms, cfa, cfa_size, active_area = read_img(raw, raw_path)
+            im, bl, wl, wb, ccms, cfa, cfa_size, active_area, make, model, fwms = read_img(raw, raw_path)
             im = (im - bl) / (raw.white_level - bl)
             im = (im * ratio).clip(max=torch.tensor(1.0))
 
-            # margin = 32
-            # im_part = []
-            # im_part.append(im[:, :, :im.shape[2]//2 + margin, :im.shape[3]//2 + margin])
-            # im_part.append(im[:, :, :im.shape[2]//2 + margin, im.shape[3]//2 - margin:])
-            # im_part.append(im[:, :, im.shape[2]//2 - margin:, :im.shape[3]//2 + margin])
-            # im_part.append(im[:, :, im.shape[2]//2 - margin:, im.shape[3]//2 - margin:])
-            #
-            # result_part = []
-            # for image in im_part:
-            #     image = image.to(device)
-            #     result_part.append(network_g(image).clip(0, 1).cpu())
-            #
-            # result_top = torch.cat([result_part[0][:, :, 0:-margin, 0:-margin], result_part[1][:, :, 0:-margin, margin:]], dim=3)
-            # result_bottom = torch.cat([result_part[2][:, :, margin:, 0:-margin], result_part[3][:, :, margin:, margin:]], dim=3)
-            # result = torch.cat([result_top, result_bottom], dim=2)
-
-            #exit(0)
             im = im.to(device)
             result = network_g(im)
             result = result.clip(0, 1).cpu()
 
             postprocess(raw, result, bl, raw.white_level, args.bps)
             #cv2.imwrite(os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_bayer.png"), bayer_result.astype(np.uint16))
-            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + "_denoised" + ".dng")
+            output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
             
-            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size, active_area)
+            save_as_dng(raw.raw_image, output_name, args.bps, bl, wl, wb, ccms, cfa, cfa_size,
+                        active_area, make=make, model=model, fwms=fwms)
             with exiftool.ExifTool() as et:
                 et.execute(b"-overwrite_original",
                             f"-tagsFromFile={raw_path}".encode("utf-8"),
                             b"-all:all",
                             output_name.encode("utf-8"))
+
+            print(f'Saved: {os.path.basename(output_name)}')
+
 
 if __name__ == '__main__':
     image_process()
