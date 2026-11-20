@@ -126,10 +126,11 @@ def _matrix_to_pairs(mat):
     pairs = []
     for row in mat:
         for v in row:
-            # Convert to rational with denominator 10000
+            # Convert to rational with denominator 10000000 (8 decimal places)
+            # This preserves 32-bit float precision exactly
             val = float(v)
-            num = int(round(val * 10000))
-            pairs.append([num, 10000])
+            num = int(round(val * 10000000))
+            pairs.append([num, 10000000])
     return pairs
 
 
