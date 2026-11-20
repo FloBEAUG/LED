@@ -451,6 +451,7 @@ def image_process():
                                 wb, ccms, cfa, cfa_size,
                                 active_area, make=make, model=model, fwms=fwms)
             else:
+                output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
                 im_norm = (im - bl) / (raw.white_level - bl)
                 im_norm = im_norm.clip(max=torch.tensor(1.0))
 
