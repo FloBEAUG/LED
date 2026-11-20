@@ -193,9 +193,12 @@ def _extract_ccms(raw, metadata):
     """Extract Color Correction Matrices from source file metadata.
 
     Priority:
-      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
+      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from source RAW metadata
       2. rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
       3. Hardcoded defaults
+
+    ForwardMatrix is read from EXIF ForwardMatrix1/2 if available,
+    otherwise computed as inverse of ColorMatrix.
 
     Returns:
         (ccms, fwms): each is a list of 2 matrices
@@ -209,6 +212,8 @@ def _extract_ccms(raw, metadata):
 
     cm1 = None
     cm2 = None
+    fm1 = None
+    fm2 = None
 
     # 1. Try EXIF ColorMatrix1/2 first (e.g., from DNG source files like RN9P.dng)
     cm1_raw = metadata[0].get('EXIF:ColorMatrix1')
@@ -224,7 +229,36 @@ def _extract_ccms(raw, metadata):
         if len(cm2_vals) >= 9:
             cm2 = cm2_vals[:9].reshape(3, 3)
 
-    # 2. Fall back to rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
+    # 2. Try EXIF ForwardMatrix1/2 first (e.g., from DNG source files)
+    fm1_raw = metadata[0].get('EXIF:ForwardMatrix1')
+    fm2_raw = metadata[0].get('EXIF:ForwardMatrix2')
+
+    if fm1_raw is None:
+        fm1_raw = metadata[0].get('ForwardMatrix1')
+    if fm2_raw is None:
+        fm2_raw = metadata[0].get('ForwardMatrix2')
+    if fm1_raw is None:
+        for k, v in metadata[0].items():
+            if 'ForwardMatrix1' in k:
+                fm1_raw = v
+                break
+    if fm2_raw is None:
+        for k, v in metadata[0].items():
+            if 'ForwardMatrix2' in k:
+                fm2_raw = v
+                break
+
+    if fm1_raw is not None:
+        fm1_vals = np.fromstring(fm1_raw, dtype=np.float64, sep=' ')
+        if len(fm1_vals) >= 9:
+            fm1 = fm1_vals[:9].reshape(3, 3)
+
+    if fm2_raw is not None:
+        fm2_vals = np.fromstring(fm2_raw, dtype=np.float64, sep=' ')
+        if len(fm2_vals) >= 9:
+            fm2 = fm2_vals[:9].reshape(3, 3)
+
+    # 3. Fall back to rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
     if cm1 is None:
         if hasattr(raw, 'rgb_xyz_matrix') and raw.rgb_xyz_matrix is not None:
             rxyz = np.array(raw.rgb_xyz_matrix[:3, :3], dtype=np.float64)
@@ -232,16 +266,27 @@ def _extract_ccms(raw, metadata):
                 cm1 = rxyz
                 cm2 = rxyz.copy()  # Same matrix for both illuminants if only one available
 
-    # 3. Compute ForwardMatrix = inverse of ColorMatrix
-    if cm1 is not None:
+    # 4. Compute missing matrix from the other (inverse relationship)
+    if cm1 is not None and fm1 is None:
         try:
             fm1 = np.linalg.inv(cm1)
         except np.linalg.LinAlgError:
             fm1 = np.eye(3)
-        fm2 = np.linalg.inv(cm2) if cm2 is not None else fm1.copy()
-    else:
-        fm1 = None
-        fm2 = None
+    if cm2 is not None and fm2 is None:
+        try:
+            fm2 = np.linalg.inv(cm2)
+        except np.linalg.LinAlgError:
+            fm2 = fm1.copy() if fm1 is not None else np.eye(3)
+    if fm1 is not None and cm1 is None:
+        try:
+            cm1 = np.linalg.inv(fm1)
+        except np.linalg.LinAlgError:
+            cm1 = np.eye(3)
+    if fm2 is not None and cm2 is None:
+        try:
+            cm2 = np.linalg.inv(fm2)
+        except np.linalg.LinAlgError:
+            cm2 = cm1.copy() if cm1 is not None else np.eye(3)
 
     # Convert to DNG rational pairs
     if cm1 is not None:
