@@ -307,6 +307,49 @@ def  postprocess(raw, im, bl, wl, output_bps=16):
     H, W = im.shape
     raw.raw_image_visible[:H, :W] = im
 
+
+def run_inference_tiled(network_g, im_norm, device, margin=32):
+    """Run inference with quadrant tiling + margin to avoid OOM on large images.
+
+    Splits the packed-bayer tensor into 4 quadrants with margin overlap,
+    processes each tile on the GPU independently, then stitches results back.
+
+    Args:
+        im_norm: normalized packed bayer tensor (1, 4, H_p, W_p) where
+                 H_p = H_full // 2, W_p = W_full // 2
+        device: torch device (cuda)
+        margin: tile overlap margin in packed-domain pixels
+
+    Returns:
+        denoised packed tensor (1, 4, H_p, W_p) on CPU
+    """
+    h, w = im_norm.shape[2], im_norm.shape[3]
+    h_half, w_half = h // 2, w // 2
+
+    out = torch.zeros_like(im_norm)
+
+    for th0, th1 in [(0, h_half), (h_half, h)]:
+        for tw0, tw1 in [(0, w_half), (w_half, w)]:
+            # Expand tile with margin, clamp to bounds
+            t_h0 = max(0, th0 - margin)
+            t_h1 = min(h, th1 + margin)
+            t_w0 = max(0, tw0 - margin)
+            t_w1 = min(w, tw1 + margin)
+
+            tile = im_norm[:, :, t_h0:t_h1, t_w0:t_w1].to(device)
+            with torch.no_grad():
+                res = network_g(tile).clip(0, 1).cpu()
+
+            # Valid region within tile result (exclude margins)
+            v_h0 = th0 - t_h0
+            v_h1 = v_h0 + (th1 - th0)
+            v_w0 = tw0 - t_w0
+            v_w1 = v_w0 + (tw1 - tw0)
+
+            out[:, :, th0:th1, tw0:tw1] = res[:, :, v_h0:v_h1, v_w0:v_w1]
+
+    return out
+
 @torch.no_grad()
 def image_process():
     parser = argparse.ArgumentParser()
@@ -320,6 +363,7 @@ def image_process():
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
     parser.add_argument('--cpu', action='store_true', help='force CPU inference (no GPU tiling). Default: use GPU if available.')
     parser.add_argument('--no-denoise', action='store_true', help='skip denoising, output raw image as DNG for color comparison.')
+    parser.add_argument('--margin', type=int, default=32, help='tile margin in packed-domain pixels for GPU tiling. Default: 32.')
     args = parser.parse_args()
 
     print('Building network...')
@@ -358,9 +402,14 @@ def image_process():
                 im_norm = (im - bl) / (raw.white_level - bl)
                 im_norm = im_norm.clip(max=torch.tensor(1.0))
 
-                im_norm = im_norm.to(device)
-                result = network_g(im_norm)
-                result = result.clip(0, 1).cpu()
+                if args.cpu:
+                    # CPU: process full image at once
+                    im_norm = im_norm.to(device)
+                    result = network_g(im_norm)
+                    result = result.clip(0, 1).cpu()
+                else:
+                    # GPU: use tiling to avoid OOM on large images
+                    result = run_inference_tiled(network_g, im_norm, device, margin=args.margin)
 
                 postprocess(raw, result, bl, raw.white_level, args.bps)
 
