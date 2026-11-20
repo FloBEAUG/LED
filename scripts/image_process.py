@@ -366,13 +366,18 @@ def image_process():
     parser.add_argument('--margin', type=int, default=32, help='tile margin in packed-domain pixels for GPU tiling. Default: 32.')
     args = parser.parse_args()
 
-    print('Building network...')
-    network_g = build_network(yaml_load(args.network_options)['network_g'])
-    print('Loading checkpoint...')
-    load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
-    device = get_available_device(force_cpu=args.cpu)
-    network_g = network_g.to(device)
-    network_g.eval()
+    if not args.no_denoise:
+        print('Building network...')
+        network_g = build_network(yaml_load(args.network_options)['network_g'])
+        print('Loading checkpoint...')
+        load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
+        device = get_available_device(force_cpu=args.cpu)
+        network_g = network_g.to(device)
+        network_g.eval()
+    else:
+        network_g = None
+        device = None
+        print('Skipping network load (--no-denoise mode)')
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
