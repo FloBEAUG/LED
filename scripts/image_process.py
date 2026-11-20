@@ -10,6 +10,7 @@ import argparse
 import glob
 import numpy as np
 import os
+import shutil
 from tqdm import tqdm
 from pidng.core import RAW2DNG, DNGTags, Tag
 from pidng.defs import *
@@ -441,14 +442,14 @@ def image_process():
 
             if args.no_denoise:
                 output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_raw{suffix}.dng')
-            else:
-                output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
-
-            if args.no_denoise:
-                # Passthrough mode: save raw image as-is without denoising
-                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
-                            wb, ccms, cfa, cfa_size,
-                            active_area, make=make, model=model, fwms=fwms)
+                # For DNG source files, copy directly to preserve ALL metadata exactly
+                # Instead of creating a new DNG via save_as_dng which changes structure
+                if pathlib.Path(raw_path).suffix.lower() == '.dng':
+                    shutil.copy2(raw_path, output_name)
+                else:
+                    save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                                wb, ccms, cfa, cfa_size,
+                                active_area, make=make, model=model, fwms=fwms)
             else:
                 im_norm = (im - bl) / (raw.white_level - bl)
                 im_norm = im_norm.clip(max=torch.tensor(1.0))
