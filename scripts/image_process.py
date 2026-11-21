@@ -356,6 +356,7 @@ def image_process():
                             active_area, make=make, model=model, fwms=fwms)
             else:
                 im_norm = (im - bl) / (raw.white_level - bl)
+                im_norm = im_norm * ratio
                 im_norm = im_norm.clip(max=torch.tensor(1.0))
 
                 im_norm = im_norm.to(device)
