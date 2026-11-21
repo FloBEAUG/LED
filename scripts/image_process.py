@@ -10,6 +10,7 @@ import argparse
 import glob
 import numpy as np
 import os
+import shutil
 from tqdm import tqdm
 from pidng.core import RAW2DNG, DNGTags, Tag
 from pidng.defs import *
@@ -126,10 +127,11 @@ def _matrix_to_pairs(mat):
     pairs = []
     for row in mat:
         for v in row:
-            # Convert to rational with denominator 10000
+            # Convert to rational with denominator 10000000 (8 decimal places)
+            # This preserves 32-bit float precision exactly
             val = float(v)
-            num = int(round(val * 10000))
-            pairs.append([num, 10000])
+            num = int(round(val * 10000000))
+            pairs.append([num, 10000000])
     return pairs
 
 
@@ -193,9 +195,12 @@ def _extract_ccms(raw, metadata):
     """Extract Color Correction Matrices from source file metadata.
 
     Priority:
-      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from exiftool metadata
+      1. EXIF:ColorMatrix1 / EXIF:ColorMatrix2 from source RAW metadata
       2. rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
       3. Hardcoded defaults
+
+    ForwardMatrix is read from EXIF ForwardMatrix1/2 if available,
+    otherwise computed as inverse of ColorMatrix.
 
     Returns:
         (ccms, fwms): each is a list of 2 matrices
@@ -209,6 +214,8 @@ def _extract_ccms(raw, metadata):
 
     cm1 = None
     cm2 = None
+    fm1 = None
+    fm2 = None
 
     # 1. Try EXIF ColorMatrix1/2 first (e.g., from DNG source files like RN9P.dng)
     cm1_raw = metadata[0].get('EXIF:ColorMatrix1')
@@ -224,7 +231,36 @@ def _extract_ccms(raw, metadata):
         if len(cm2_vals) >= 9:
             cm2 = cm2_vals[:9].reshape(3, 3)
 
-    # 2. Fall back to rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
+    # 2. Try EXIF ForwardMatrix1/2 first (e.g., from DNG source files)
+    fm1_raw = metadata[0].get('EXIF:ForwardMatrix1')
+    fm2_raw = metadata[0].get('EXIF:ForwardMatrix2')
+
+    if fm1_raw is None:
+        fm1_raw = metadata[0].get('ForwardMatrix1')
+    if fm2_raw is None:
+        fm2_raw = metadata[0].get('ForwardMatrix2')
+    if fm1_raw is None:
+        for k, v in metadata[0].items():
+            if 'ForwardMatrix1' in k:
+                fm1_raw = v
+                break
+    if fm2_raw is None:
+        for k, v in metadata[0].items():
+            if 'ForwardMatrix2' in k:
+                fm2_raw = v
+                break
+
+    if fm1_raw is not None:
+        fm1_vals = np.fromstring(fm1_raw, dtype=np.float64, sep=' ')
+        if len(fm1_vals) >= 9:
+            fm1 = fm1_vals[:9].reshape(3, 3)
+
+    if fm2_raw is not None:
+        fm2_vals = np.fromstring(fm2_raw, dtype=np.float64, sep=' ')
+        if len(fm2_vals) >= 9:
+            fm2 = fm2_vals[:9].reshape(3, 3)
+
+    # 3. Fall back to rawpy.rgb_xyz_matrix (LibRaw XYZ->camera RGB matrix)
     if cm1 is None:
         if hasattr(raw, 'rgb_xyz_matrix') and raw.rgb_xyz_matrix is not None:
             rxyz = np.array(raw.rgb_xyz_matrix[:3, :3], dtype=np.float64)
@@ -232,16 +268,27 @@ def _extract_ccms(raw, metadata):
                 cm1 = rxyz
                 cm2 = rxyz.copy()  # Same matrix for both illuminants if only one available
 
-    # 3. Compute ForwardMatrix = inverse of ColorMatrix
-    if cm1 is not None:
+    # 4. Compute missing matrix from the other (inverse relationship)
+    if cm1 is not None and fm1 is None:
         try:
             fm1 = np.linalg.inv(cm1)
         except np.linalg.LinAlgError:
             fm1 = np.eye(3)
-        fm2 = np.linalg.inv(cm2) if cm2 is not None else fm1.copy()
-    else:
-        fm1 = None
-        fm2 = None
+    if cm2 is not None and fm2 is None:
+        try:
+            fm2 = np.linalg.inv(cm2)
+        except np.linalg.LinAlgError:
+            fm2 = fm1.copy() if fm1 is not None else np.eye(3)
+    if fm1 is not None and cm1 is None:
+        try:
+            cm1 = np.linalg.inv(fm1)
+        except np.linalg.LinAlgError:
+            cm1 = np.eye(3)
+    if fm2 is not None and cm2 is None:
+        try:
+            cm2 = np.linalg.inv(fm2)
+        except np.linalg.LinAlgError:
+            cm2 = cm1.copy() if cm1 is not None else np.eye(3)
 
     # Convert to DNG rational pairs
     if cm1 is not None:
@@ -307,6 +354,49 @@ def  postprocess(raw, im, bl, wl, output_bps=16):
     H, W = im.shape
     raw.raw_image_visible[:H, :W] = im
 
+
+def run_inference_tiled(network_g, im_norm, device, margin=32):
+    """Run inference with quadrant tiling + margin to avoid OOM on large images.
+
+    Splits the packed-bayer tensor into 4 quadrants with margin overlap,
+    processes each tile on the GPU independently, then stitches results back.
+
+    Args:
+        im_norm: normalized packed bayer tensor (1, 4, H_p, W_p) where
+                 H_p = H_full // 2, W_p = W_full // 2
+        device: torch device (cuda)
+        margin: tile overlap margin in packed-domain pixels
+
+    Returns:
+        denoised packed tensor (1, 4, H_p, W_p) on CPU
+    """
+    h, w = im_norm.shape[2], im_norm.shape[3]
+    h_half, w_half = h // 2, w // 2
+
+    out = torch.zeros_like(im_norm)
+
+    for th0, th1 in [(0, h_half), (h_half, h)]:
+        for tw0, tw1 in [(0, w_half), (w_half, w)]:
+            # Expand tile with margin, clamp to bounds
+            t_h0 = max(0, th0 - margin)
+            t_h1 = min(h, th1 + margin)
+            t_w0 = max(0, tw0 - margin)
+            t_w1 = min(w, tw1 + margin)
+
+            tile = im_norm[:, :, t_h0:t_h1, t_w0:t_w1].to(device)
+            with torch.no_grad():
+                res = network_g(tile).clip(0, 1).cpu()
+
+            # Valid region within tile result (exclude margins)
+            v_h0 = th0 - t_h0
+            v_h1 = v_h0 + (th1 - th0)
+            v_w0 = tw0 - t_w0
+            v_w1 = v_w0 + (tw1 - tw0)
+
+            out[:, :, th0:th1, tw0:tw1] = res[:, :, v_h0:v_h1, v_w0:v_w1]
+
+    return out
+
 @torch.no_grad()
 def image_process():
     parser = argparse.ArgumentParser()
@@ -320,15 +410,21 @@ def image_process():
     parser.add_argument('--led', action='store_true', help='if you are using a checkpoint fine-tuned by our led.')
     parser.add_argument('--cpu', action='store_true', help='force CPU inference (no GPU tiling). Default: use GPU if available.')
     parser.add_argument('--no-denoise', action='store_true', help='skip denoising, output raw image as DNG for color comparison.')
+    parser.add_argument('--margin', type=int, default=32, help='tile margin in packed-domain pixels for GPU tiling. Default: 32.')
     args = parser.parse_args()
 
-    print('Building network...')
-    network_g = build_network(yaml_load(args.network_options)['network_g'])
-    print('Loading checkpoint...')
-    load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
-    device = get_available_device(force_cpu=args.cpu)
-    network_g = network_g.to(device)
-    network_g.eval()
+    if not args.no_denoise:
+        print('Building network...')
+        network_g = build_network(yaml_load(args.network_options)['network_g'])
+        print('Loading checkpoint...')
+        load_network(network_g, args.pretrained_network, param_key='params' if not args.led else 'params_deploy')
+        device = get_available_device(force_cpu=args.cpu)
+        network_g = network_g.to(device)
+        network_g.eval()
+    else:
+        network_g = None
+        device = None
+        print('Skipping network load (--no-denoise mode)')
     raw_paths = [os.path.join(args.data_path, file) for file in os.listdir(args.data_path) if os.path.isfile(os.path.join(args.data_path, file))]
     ratio = args.ratio
     os.makedirs(args.save_path, exist_ok=True)
@@ -346,22 +442,28 @@ def image_process():
 
             if args.no_denoise:
                 output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_raw{suffix}.dng')
+                # For DNG source files, copy directly to preserve ALL metadata exactly
+                # Instead of creating a new DNG via save_as_dng which changes structure
+                if pathlib.Path(raw_path).suffix.lower() == '.dng':
+                    shutil.copy2(raw_path, output_name)
+                else:
+                    save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
+                                wb, ccms, cfa, cfa_size,
+                                active_area, make=make, model=model, fwms=fwms)
             else:
                 output_name = os.path.join(args.save_path, pathlib.Path(raw_path).stem + f'_denoised{suffix}.dng')
-
-            if args.no_denoise:
-                # Passthrough mode: save raw image as-is without denoising
-                save_as_dng(raw.raw_image, output_name, args.bps, bl, wl,
-                            wb, ccms, cfa, cfa_size,
-                            active_area, make=make, model=model, fwms=fwms)
-            else:
                 im_norm = (im - bl) / (raw.white_level - bl)
                 im_norm = im_norm * ratio
                 im_norm = im_norm.clip(max=torch.tensor(1.0))
 
-                im_norm = im_norm.to(device)
-                result = network_g(im_norm)
-                result = result.clip(0, 1).cpu()
+                if args.cpu:
+                    # CPU: process full image at once
+                    im_norm = im_norm.to(device)
+                    result = network_g(im_norm)
+                    result = result.clip(0, 1).cpu()
+                else:
+                    # GPU: use tiling to avoid OOM on large images
+                    result = run_inference_tiled(network_g, im_norm, device, margin=args.margin)
 
                 postprocess(raw, result, bl, raw.white_level, args.bps)
 
