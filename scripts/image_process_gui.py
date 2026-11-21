@@ -290,15 +290,13 @@ class LEDDenoiserGUI:
             "--bps", str(self.bps_var.get()),
         ]
 
-        if args.led:
+        if self.led_var.get():
             cmd.append("--led")
-        if args.cpu:
+        if self.cpu_var.get():
             cmd.append("--cpu")
-        if args.no_denoise:
+        if self.no_denoise_var.get():
             cmd.append("--no-denoise")
 
-        cmd.extend(["--ratio", str(self.ratio_var.get())])
-        cmd.extend(["--bps", str(self.bps_var.get())])
         cmd.extend(["--margin", str(self.margin_var.get())])
 
         self.log(f"Running: {' '.join(cmd)}\n")
@@ -349,7 +347,7 @@ class LEDDenoiserGUI:
 
 def main():
     root = tk.Tk()
-    app = LEDDenoiseGUI(root)
+    app = LEDDenoiserGUI(root)
     root.mainloop()
 
 
