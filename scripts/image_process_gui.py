@@ -171,6 +171,12 @@ class LEDDenoiserGUI:
             options_frame, text="LED Fine-tuned Checkpoint",
             variable=self.led_var
         ).grid(row=0, column=2, sticky=tk.W, padx=5)
+        ttk.Label(
+            options_frame,
+            text="Check if using LED fine-tuned checkpoint (e.g., CanonEOSR7.pth)",
+            foreground="gray",
+            font=("TkDefaultFont", 8)
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, padx=5)
 
         # Margin
         ttk.Label(options_frame, text="Tile Margin (GPU only):").grid(
